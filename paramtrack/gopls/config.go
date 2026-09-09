@@ -1,13 +1,5 @@
 package main
 
-import (
-	"fmt"
-	"io"
-	"os"
-
-	"go.yaml.in/yaml/v3"
-)
-
 type Config struct {
 	/* Info about the module code */
 
@@ -28,25 +20,4 @@ type Config struct {
 	Module_path string `yaml:"module_path"`
 	// Path to the gopls code (should end in /gopls)
 	Gopls_path string `yaml:"gopls_path"`
-}
-
-func LoadConfig(file string) (*Config, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return &Config{}, fmt.Errorf("opening config file: %v", err)
-	}
-	defer f.Close()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return &Config{}, fmt.Errorf("unable to read config data: %v", err)
-	}
-
-	var c Config
-	err = yaml.Unmarshal(data, &c)
-	if err != nil {
-		return &Config{}, fmt.Errorf("unable to decode config file: %v", err)
-	}
-
-	return &c, nil
 }
