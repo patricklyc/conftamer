@@ -2,121 +2,694 @@ package http_test
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
-const conftamerConfigurationChild = "CONFTAMER_CONFIGURATION_TEST_CHILD"
+const (
+	conftamerCaptureChild       = "CONFTAMER_CAPTURE_TEST_CHILD"
+	conftamerConfigurationChild = "CONFTAMER_CONFIGURATION_TEST_CHILD"
+)
 
 var conftamerConfigurationNames = map[string]bool{
 	"CONFTAMER_EVENTS":          true,
 	"CONFTAMER_EVENTS_DIR":      true,
 	"CONFTAMER_CAPTURE_ID":      true,
+	conftamerCaptureChild:       true,
 	conftamerConfigurationChild: true,
+}
+
+type conftamerCapturedRecord struct {
+	ExchangeID uint64  `json:"exchange_id"`
+	Kind       string  `json:"kind"`
+	ContextID  *uint64 `json:"context_id"`
+	Request    struct {
+		Path string `json:"path"`
+	} `json:"request"`
+	StatusCode int `json:"status_code"`
+}
+
+type conftamerCountingBody struct {
+	reader *strings.Reader
+	reads  int
+	closes int
+}
+
+func (body *conftamerCountingBody) Read(data []byte) (int, error) {
+	body.reads++
+	return body.reader.Read(data)
+}
+func (body *conftamerCountingBody) Close() error {
+	body.closes++
+	return nil
+}
+
+type conftamerFailWriteConn struct {
+	net.Conn
+	writeCount *atomic.Int32
+}
+
+func (conn *conftamerFailWriteConn) Write(data []byte) (int, error) {
+	if conn.writeCount.Add(1) == 2 {
+		return 1, http.ExportErrServerClosedIdle
+	}
+	return conn.Conn.Write(data)
+}
+
+func TestConftamerExchangeOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name, mode string
+		http2      bool
+	}{
+		{name: "HTTP/1", mode: "http1"},
+		{name: "HTTP/2", mode: "http2", http2: true},
+		{name: "direct RoundTrip", mode: "direct"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.http2 {
+				http.CondSkipHTTP2(t)
+			}
+			assertConftamerExchange(t, captureConftamerMode(t, test.mode))
+		})
+	}
+}
+
+func TestConftamerContextLifetimes(t *testing.T) {
+	records := captureConftamerMode(t, "contexts")
+	if len(records) != 8 {
+		t.Fatalf("record count = %d, want 8", len(records))
+	}
+	requests := conftamerRecords(records, "", "request")
+	wantKinds := []string{"send_request", "receive_request", "send_request", "receive_request"}
+	wantContexts := []uint64{0, 1, 2, 3}
+	if len(requests) != len(wantKinds) {
+		t.Fatalf("request records = %d, want %d", len(requests), len(wantKinds))
+	}
+	for index, record := range requests {
+		if record.Kind != wantKinds[index] || conftamerContextValue(record) != wantContexts[index] {
+			t.Fatalf("request %d = (%s, %d), want (%s, %d)", index, record.Kind, conftamerContextValue(record), wantKinds[index], wantContexts[index])
+		}
+	}
+}
+
+func TestConftamerContextDisabledIsIdentity(t *testing.T) {
+	if os.Getenv("CONFTAMER_EVENTS_DIR") != "" || os.Getenv("CONFTAMER_CAPTURE_ID") != "" {
+		t.Skip("requires capture-disabled parent process")
+	}
+	ctx := context.WithValue(context.Background(), struct{ name string }{"existing"}, true)
+	if http.ConftamerContext(ctx) != ctx || http.ConftamerContext(nil) != nil {
+		t.Fatal("disabled ConftamerContext changed its argument")
+	}
+}
+
+func TestConftamerInvalidRequestEmitsNothing(t *testing.T) {
+	if records := captureConftamerMode(t, "invalid"); len(records) != 0 {
+		t.Fatalf("invalid request records = %+v, want none", records)
+	}
+}
+
+func TestConftamerAttemptLifetimes(t *testing.T) {
+	t.Run("server request copied outbound", func(t *testing.T) {
+		records := captureConftamerMode(t, "nested")
+		requests := conftamerRecords(records, "", "request")
+		if len(records) != 8 || len(requests) != 4 {
+			t.Fatalf("records/requests = %d/%d, want 8/4", len(records), len(requests))
+		}
+		seen := make(map[uint64]bool)
+		for _, record := range requests {
+			seen[record.ExchangeID] = true
+		}
+		outer := conftamerOnlyRecord(t, records, "receive_request", "/nested")
+		inner := conftamerOnlyRecord(t, records, "send_request", "/backend")
+		if len(seen) != 4 || outer.ContextID == nil || conftamerContextValue(outer) != conftamerContextValue(inner) {
+			t.Fatalf("request exchanges/contexts = %v/%v/%v", seen, outer.ContextID, inner.ContextID)
+		}
+	})
+
+	t.Run("redirect", func(t *testing.T) {
+		records := captureConftamerMode(t, "redirect")
+		attempts := conftamerRecords(records, "send_request", "/redirect/")
+		assertConftamerAttempts(t, records, attempts, 2)
+	})
+
+	t.Run("retry", func(t *testing.T) {
+		records := captureConftamerMode(t, "retry")
+		attempts := conftamerRecords(records, "send_request", "/retry/2")
+		assertConftamerAttempts(t, records, attempts, 1)
+		if got := len(conftamerRecords(records, "receive_request", "/retry/2")); got != 1 {
+			t.Fatalf("retried server requests = %d, want 1", got)
+		}
+	})
+}
+
+func TestConftamerResponseLifecycles(t *testing.T) {
+	for _, protocol := range []string{"http1", "http2"} {
+		t.Run(protocol, func(t *testing.T) {
+			if protocol == "http2" {
+				http.CondSkipHTTP2(t)
+			}
+			want := map[string]int{
+				"/empty": 200, "/explicit": 200, "/informational": 200,
+				"/implicit": 200, "/repeated": 202,
+			}
+			if protocol == "http1" {
+				want["/switch"] = 101
+			}
+			assertConftamerLifecycles(t, captureConftamerMode(t, "lifecycle-"+protocol), want)
+		})
+	}
+}
+
+func TestConftamerHTTPBehaviorPreserved(t *testing.T) {
+	for _, mode := range []string{"behavior-data", "behavior-cancel"} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(mode+map[bool]string{false: "-disabled", true: "-enabled"}[enabled], func(t *testing.T) {
+				if !enabled {
+					runConftamerChild(t, mode, nil, false)
+					return
+				}
+				if records := captureConftamerMode(t, mode); len(records) == 0 {
+					t.Fatal("enabled preservation workload emitted no records")
+				}
+			})
+		}
+	}
+}
+
+func assertConftamerExchange(t *testing.T, records []conftamerCapturedRecord) {
+	t.Helper()
+	if len(records) != 4 {
+		t.Fatalf("record count = %d, want 4: %+v", len(records), records)
+	}
+	wantKinds := []string{"send_request", "receive_request", "send_response", "receive_response"}
+	for index, want := range wantKinds {
+		if records[index].Kind != want {
+			t.Fatalf("record %d kind = %q, want %q", index, records[index].Kind, want)
+		}
+	}
+	client, server := records[0], records[1]
+	if client.ExchangeID == server.ExchangeID || records[2].ExchangeID != server.ExchangeID || records[3].ExchangeID != client.ExchangeID {
+		t.Fatalf("exchange IDs = %d,%d,%d,%d", client.ExchangeID, server.ExchangeID, records[2].ExchangeID, records[3].ExchangeID)
+	}
+	if client.ContextID == nil || server.ContextID == nil || conftamerContextValue(client) == conftamerContextValue(server) {
+		t.Fatalf("request context IDs = (%v, %v), want distinct known roots", client.ContextID, server.ContextID)
+	}
+}
+
+func assertConftamerAttempts(t *testing.T, records, attempts []conftamerCapturedRecord, wantResponses int) {
+	t.Helper()
+	if len(attempts) != 2 || attempts[0].ExchangeID == attempts[1].ExchangeID || attempts[0].ContextID == nil || conftamerContextValue(attempts[0]) != conftamerContextValue(attempts[1]) {
+		t.Fatalf("attempts = %+v, want two exchanges sharing one known root", attempts)
+	}
+	responseExchanges := make(map[uint64]bool)
+	for _, record := range records {
+		if record.Kind == "receive_response" {
+			responseExchanges[record.ExchangeID] = true
+		}
+	}
+	responses := 0
+	for _, attempt := range attempts {
+		if responseExchanges[attempt.ExchangeID] {
+			responses++
+		}
+	}
+	if responses != wantResponses {
+		t.Fatalf("attempt responses = %d, want %d", responses, wantResponses)
+	}
+}
+
+func assertConftamerLifecycles(t *testing.T, records []conftamerCapturedRecord, want map[string]int) {
+	t.Helper()
+	paths := make(map[uint64]string)
+	responses := make(map[string][]int)
+	for _, record := range records {
+		if strings.HasSuffix(record.Kind, "request") {
+			paths[record.ExchangeID] = record.Request.Path
+		} else if path := paths[record.ExchangeID]; path != "" {
+			responses[path+"/"+record.Kind] = append(responses[path+"/"+record.Kind], record.StatusCode)
+		}
+	}
+	for path, status := range want {
+		if len(conftamerRecords(records, "", path)) != 2 {
+			t.Errorf("%s request origins != 2", path)
+		}
+		for _, kind := range []string{"send_response", "receive_response"} {
+			got := responses[path+"/"+kind]
+			if len(got) != 1 || got[0] != status {
+				t.Errorf("%s %s statuses = %v, want [%d]", path, kind, got, status)
+			}
+		}
+	}
+	if len(conftamerRecords(records, "", "/panic")) != 2 || len(responses["/panic/send_response"])+len(responses["/panic/receive_response"]) != 0 {
+		t.Error("panic must have two origins and no response")
+	}
+}
+
+func conftamerRecords(records []conftamerCapturedRecord, kind, selector string) []conftamerCapturedRecord {
+	var matches []conftamerCapturedRecord
+	for _, record := range records {
+		kindMatch := kind == "" || record.Kind == kind
+		selectorMatch := selector == "request" && strings.HasSuffix(record.Kind, "request") || selector != "request" && strings.Contains(record.Request.Path, selector)
+		if kindMatch && selectorMatch {
+			matches = append(matches, record)
+		}
+	}
+	return matches
+}
+
+func conftamerOnlyRecord(t *testing.T, records []conftamerCapturedRecord, kind, path string) conftamerCapturedRecord {
+	t.Helper()
+	matches := conftamerRecords(records, kind, path)
+	if len(matches) != 1 {
+		t.Fatalf("%s %s records = %d, want 1", kind, path, len(matches))
+	}
+	return matches[0]
+}
+
+func conftamerContextValue(record conftamerCapturedRecord) uint64 {
+	if record.ContextID == nil {
+		return 0
+	}
+	return *record.ContextID
+}
+
+func TestConftamerCaptureChild(t *testing.T) {
+	mode := os.Getenv(conftamerCaptureChild)
+	if mode == "" {
+		t.Skip("helper process")
+	}
+	if mode == "invalid" {
+		testConftamerInvalidRequest(t)
+		return
+	}
+
+	started := make(chan struct{}, 1)
+	var backendURL string
+	if mode == "nested" {
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+		defer backend.Close()
+		backendURL = backend.URL
+	}
+	handler := conftamerTestHandler(t, backendURL, started)
+	server := httptest.NewServer(handler)
+	if mode == "http2" || mode == "lifecycle-http2" {
+		server.Close()
+		server = httptest.NewUnstartedServer(handler)
+		server.EnableHTTP2 = true
+		server.StartTLS()
+	}
+	defer server.Close()
+	client := http.DefaultClient
+	if server.TLS != nil {
+		client = server.Client()
+	}
+
+	switch mode {
+	case "behavior-data":
+		testConftamerBodyAndTrailers(t, client, server.URL)
+	case "behavior-cancel":
+		testConftamerCancellation(t, server.URL, started)
+	case "redirect":
+		testConftamerRedirect(t, server.URL)
+	case "retry":
+		testConftamerRetry(t, server.URL)
+	case "lifecycle-http1", "lifecycle-http2":
+		paths := []string{"/empty", "/explicit", "/informational", "/implicit", "/repeated"}
+		if mode == "lifecycle-http1" {
+			paths = append(paths, "/switch")
+		}
+		for _, path := range paths {
+			conftamerLifecycleRequest(t, client, server.URL+path, false)
+		}
+		conftamerLifecycleRequest(t, client, server.URL+"/panic", true)
+	case "contexts":
+		conftamerRequest(t, client, server.URL+"/unknown", context.Background(), false, 1)
+		conftamerRequest(t, client, server.URL+"/rooted", http.ConftamerContext(context.Background()), false, 1)
+	default:
+		root := http.ConftamerContext(context.Background())
+		if http.ConftamerContext(root) != root {
+			t.Fatal("stamping an existing root changed its identity")
+		}
+		ctx := context.WithValue(root, struct{ name string }{"derived"}, true)
+		path, direct, protocol := "/resource", mode == "direct", 1
+		if mode == "nested" {
+			path = "/nested"
+		}
+		if mode == "http2" {
+			protocol = 2
+		}
+		conftamerRequest(t, client, server.URL+path, ctx, direct, protocol)
+	}
+}
+
+func conftamerTestHandler(t *testing.T, backendURL string, started chan<- struct{}) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/implicit":
+			_, _ = io.WriteString(w, "body")
+		case "/empty":
+		case "/explicit":
+			w.WriteHeader(http.StatusOK)
+		case "/informational":
+			w.WriteHeader(http.StatusEarlyHints)
+			w.WriteHeader(http.StatusOK)
+		case "/repeated":
+			w.WriteHeader(http.StatusAccepted)
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/switch":
+			w.Header().Set("Connection", "Upgrade")
+			w.Header().Set("Upgrade", "conftamer-test")
+			w.WriteHeader(http.StatusSwitchingProtocols)
+		case "/panic":
+			panic(http.ErrAbortHandler)
+		case "/redirect/start":
+			http.Redirect(w, request, "/redirect/final", http.StatusFound)
+		case "/behavior/data":
+			data, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			w.Header().Set("Trailer", "X-Conftamer-Trailer")
+			w.(http.Flusher).Flush()
+			_, _ = w.Write(data)
+			w.Header().Set("X-Conftamer-Trailer", "complete")
+		case "/behavior/cancel":
+			started <- struct{}{}
+			<-request.Context().Done()
+		case "/nested":
+			outbound := new(http.Request)
+			*outbound = *request
+			outbound.URL, _ = url.Parse(backendURL + "/backend")
+			outbound.Host, outbound.RequestURI, outbound.Body, outbound.ContentLength = "", "", nil, 0
+			response, err := http.DefaultClient.Do(outbound)
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			response.Body.Close()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+}
+
+func testConftamerInvalidRequest(t *testing.T) {
+	request, err := http.NewRequest(http.MethodGet, "http://example.test/invalid", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.URL.Host = ""
+	response, err := http.DefaultTransport.RoundTrip(request)
+	if response != nil {
+		response.Body.Close()
+		t.Fatalf("invalid request response = %+v", response)
+	}
+	if err == nil || err.Error() != "http: no Host in request URL" {
+		t.Fatalf("invalid request error = %v", err)
+	}
+}
+
+func testConftamerBodyAndTrailers(t *testing.T, client *http.Client, serverURL string) {
+	body := &conftamerCountingBody{reader: strings.NewReader("request body")}
+	request, err := http.NewRequestWithContext(http.ConftamerContext(context.Background()), http.MethodPost, serverURL+"/behavior/data", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil || string(data) != "request body" || response.Trailer.Get("X-Conftamer-Trailer") != "complete" {
+		t.Fatalf("response data/trailer/errors = %q/%q/%v/%v", data, response.Trailer.Get("X-Conftamer-Trailer"), readErr, closeErr)
+	}
+	if body.reads == 0 || body.closes != 1 || response.Request != request {
+		t.Fatalf("body reads/closes or request identity = %d/%d/%t", body.reads, body.closes, response.Request == request)
+	}
+}
+
+func testConftamerCancellation(t *testing.T, serverURL string, started <-chan struct{}) {
+	run := func(client *http.Client, request *http.Request, cancel func()) error {
+		result := make(chan error, 1)
+		go func() {
+			response, err := client.Do(request)
+			if response != nil {
+				response.Body.Close()
+			}
+			result <- err
+		}()
+		<-started
+		cancel()
+		return <-result
+	}
+	newRequest := func(ctx context.Context) *http.Request {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL+"/behavior/cancel", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return request
+	}
+
+	ctx, cancel := context.WithCancel(http.ConftamerContext(context.Background()))
+	if err := run(http.DefaultClient, newRequest(ctx), cancel); !errors.Is(err, context.Canceled) {
+		t.Fatalf("context cancellation error = %v", err)
+	}
+	legacy := make(chan struct{})
+	legacyRequest := newRequest(http.ConftamerContext(context.Background()))
+	legacyRequest.Cancel = legacy
+	if err := run(http.DefaultClient, legacyRequest, func() { close(legacy) }); err == nil || !strings.Contains(err.Error(), "request canceled") {
+		t.Fatalf("Request.Cancel error = %v", err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	defer transport.CloseIdleConnections()
+	transportRequest := newRequest(http.ConftamerContext(context.Background()))
+	if err := run(&http.Client{Transport: transport}, transportRequest, func() { transport.CancelRequest(transportRequest) }); err == nil || !strings.Contains(err.Error(), "request canceled") {
+		t.Fatalf("CancelRequest error = %v", err)
+	}
+	deadline, stop := context.WithTimeout(http.ConftamerContext(context.Background()), 50*time.Millisecond)
+	defer stop()
+	response, err := http.DefaultClient.Do(newRequest(deadline))
+	if response != nil {
+		response.Body.Close()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline error = %v", err)
+	}
+}
+
+func testConftamerRedirect(t *testing.T, serverURL string) {
+	var redirected *http.Request
+	client := &http.Client{CheckRedirect: func(next *http.Request, via []*http.Request) error {
+		if len(via) != 1 || next.Response == nil || next.Response.Request != via[0] {
+			return errors.New("unexpected redirect chain")
+		}
+		redirected = next
+		return nil
+	}}
+	request, err := http.NewRequestWithContext(http.ConftamerContext(context.Background()), http.MethodGet, serverURL+"/redirect/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalContext := request.Context()
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if redirected == nil || redirected.Context() != originalContext || request.Context() != originalContext || response.Request != redirected {
+		t.Fatal("redirect changed request or context identity")
+	}
+}
+
+func testConftamerRetry(t *testing.T, serverURL string) {
+	writeCount := new(atomic.Int32)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		connection, err := (&net.Dialer{}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &conftamerFailWriteConn{Conn: connection, writeCount: writeCount}, nil
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	retried := make(chan struct{}, 1)
+	http.SetRoundTripRetried(func() { retried <- struct{}{} })
+	defer http.SetRoundTripRetried(nil)
+	for _, path := range []string{"/retry/1", "/retry/2", "/retry/3"} {
+		conftamerRequest(t, client, serverURL+path, http.ConftamerContext(context.Background()), false, 1)
+	}
+	select {
+	case <-retried:
+	default:
+		t.Fatal("transport did not report a retry")
+	}
+}
+
+func conftamerLifecycleRequest(t *testing.T, client *http.Client, target string, wantError bool) {
+	t.Helper()
+	request, err := http.NewRequestWithContext(http.ConftamerContext(context.Background()), http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if wantError {
+		if err == nil {
+			response.Body.Close()
+			t.Fatal("request error = nil")
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		_, _ = io.Copy(io.Discard, response.Body)
+	}
+}
+
+func conftamerRequest(t *testing.T, client *http.Client, target string, ctx context.Context, direct bool, wantProtocol int) {
+	t.Helper()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalContext := request.Context()
+	var response *http.Response
+	if direct {
+		response, err = http.DefaultTransport.RoundTrip(request)
+	} else {
+		response, err = client.Do(request)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	_, readErr := io.Copy(io.Discard, response.Body)
+	if readErr != nil || response.StatusCode != http.StatusNoContent || response.ProtoMajor != wantProtocol || request.Context() != originalContext || response.Request != request {
+		t.Fatalf("response/read/context = %v/%v/%d/%d/%t/%t", err, readErr, response.StatusCode, response.ProtoMajor, request.Context() == originalContext, response.Request == request)
+	}
+}
+
+func captureConftamerMode(t *testing.T, mode string) []conftamerCapturedRecord {
+	t.Helper()
+	directory := t.TempDir()
+	runConftamerChild(t, mode, map[string]string{
+		"CONFTAMER_EVENTS_DIR": directory,
+		"CONFTAMER_CAPTURE_ID": "unit-capture",
+	}, true)
+	return readConftamerRecords(t, directory)
+}
+
+func runConftamerChild(t *testing.T, mode string, settings map[string]string, wantEnabled bool) {
+	t.Helper()
+	overrides := map[string]string{conftamerCaptureChild: mode}
+	for name, value := range settings {
+		overrides[name] = value
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestConftamerCaptureChild$", "-test.count=1")
+	command.Env = conftamerEnvironment(overrides)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if output, err := command.Output(); err != nil {
+		t.Fatalf("capture child failed: %v\nstdout: %s\nstderr: %s", err, output, stderr.String())
+	}
+	if got := strings.Contains(stderr.String(), "conftamer: enabled"); got != wantEnabled {
+		t.Fatalf("enabled diagnostic = %t, want %t; stderr: %q", got, wantEnabled, stderr.String())
+	}
+}
+
+func readConftamerRecords(t *testing.T, directory string) []conftamerCapturedRecord {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(directory, "*.jsonl"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("process files = %v, error = %v", files, err)
+	}
+	content, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records []conftamerCapturedRecord
+	for physicalLine, line := range bytes.Split(content, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var record conftamerCapturedRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("line %d: %v", physicalLine+1, err)
+		}
+		records = append(records, record)
+	}
+	return records
 }
 
 func TestConftamerConfiguration(t *testing.T) {
 	if os.Getenv(conftamerConfigurationChild) != "" {
 		t.Fatal("parent configuration test ran as a child")
 	}
-
-	t.Run("disabled", func(t *testing.T) {
-		stderr := runConftamerConfigurationChild(t, nil)
-		if strings.Contains(stderr, "conftamer:") {
-			t.Fatalf("disabled diagnostics = %q, want none", stderr)
-		}
-	})
-
+	if stderr := runConftamerConfigurationChild(t, nil); strings.Contains(stderr, "conftamer:") {
+		t.Fatalf("disabled diagnostics = %q", stderr)
+	}
 	for _, test := range []struct {
-		name        string
-		environment map[string]string
-		want        string
+		name string
+		env  map[string]string
+		want string
 	}{
-		{
-			name: "missing capture ID",
-			environment: map[string]string{
-				"CONFTAMER_EVENTS_DIR": t.TempDir(),
-			},
-			want: "CONFTAMER_EVENTS_DIR and CONFTAMER_CAPTURE_ID must both be set",
-		},
-		{
-			name: "missing events directory",
-			environment: map[string]string{
-				"CONFTAMER_CAPTURE_ID": "unit-capture",
-			},
-			want: "CONFTAMER_EVENTS_DIR and CONFTAMER_CAPTURE_ID must both be set",
-		},
-		{
-			name: "relative events directory",
-			environment: map[string]string{
-				"CONFTAMER_EVENTS_DIR": "relative/capture",
-				"CONFTAMER_CAPTURE_ID": "unit-capture",
-			},
-			want: "CONFTAMER_EVENTS_DIR must be absolute",
-		},
-		{
-			name: "legacy setting",
-			environment: map[string]string{
-				"CONFTAMER_EVENTS": "/tmp/legacy-events.jsonl",
-			},
-			want: "CONFTAMER_EVENTS is unsupported",
-		},
-		{
-			name: "legacy setting wins over v2",
-			environment: map[string]string{
-				"CONFTAMER_EVENTS":     "/tmp/legacy-events.jsonl",
-				"CONFTAMER_EVENTS_DIR": t.TempDir(),
-				"CONFTAMER_CAPTURE_ID": "unit-capture",
-			},
-			want: "CONFTAMER_EVENTS is unsupported",
-		},
+		{name: "missing capture ID", env: map[string]string{"CONFTAMER_EVENTS_DIR": t.TempDir()}, want: "must both be set"},
+		{name: "missing events directory", env: map[string]string{"CONFTAMER_CAPTURE_ID": "unit"}, want: "must both be set"},
+		{name: "relative directory", env: map[string]string{"CONFTAMER_EVENTS_DIR": "relative", "CONFTAMER_CAPTURE_ID": "unit"}, want: "must be absolute"},
+		{name: "legacy setting", env: map[string]string{"CONFTAMER_EVENTS": "/tmp/legacy"}, want: "CONFTAMER_EVENTS is unsupported"},
+		{name: "legacy wins over v2", env: map[string]string{"CONFTAMER_EVENTS": "/tmp/legacy", "CONFTAMER_EVENTS_DIR": t.TempDir(), "CONFTAMER_CAPTURE_ID": "unit"}, want: "CONFTAMER_EVENTS is unsupported"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			stderr := runConftamerConfigurationChild(t, test.environment)
-			if !strings.Contains(stderr, "conftamer: configuration error: "+test.want) {
+			stderr := runConftamerConfigurationChild(t, test.env)
+			if !strings.Contains(stderr, "conftamer: configuration error:") || !strings.Contains(stderr, test.want) {
 				t.Fatalf("diagnostics = %q, want %q", stderr, test.want)
 			}
-			if directory := test.environment["CONFTAMER_EVENTS_DIR"]; filepath.IsAbs(directory) {
-				assertConftamerDirectoryEmpty(t, directory)
+			if directory := test.env["CONFTAMER_EVENTS_DIR"]; filepath.IsAbs(directory) {
+				entries, err := os.ReadDir(directory)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("directory entries/error = %v/%v", entries, err)
+				}
 			}
 		})
 	}
 
-	t.Run("enabled", func(t *testing.T) {
-		directory := t.TempDir()
-		stderr := runConftamerConfigurationChild(t, map[string]string{
-			"CONFTAMER_EVENTS_DIR": directory,
-			"CONFTAMER_CAPTURE_ID": "unit-capture",
-		})
-		files, err := filepath.Glob(filepath.Join(directory, "*.jsonl"))
-		if err != nil {
-			t.Fatal(err)
+	directory := t.TempDir()
+	stderr := runConftamerConfigurationChild(t, map[string]string{"CONFTAMER_EVENTS_DIR": directory, "CONFTAMER_CAPTURE_ID": "unit-capture"})
+	files, _ := filepath.Glob(filepath.Join(directory, "*.jsonl"))
+	if len(files) != 1 {
+		t.Fatalf("process files = %v", files)
+	}
+	processID := strings.TrimSuffix(filepath.Base(files[0]), ".jsonl")
+	info, err := os.Stat(files[0])
+	if err != nil || !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(processID) || info.Mode().Perm() != 0o600 {
+		t.Fatalf("process file identity/mode/error = %q/%v/%v", processID, info.Mode().Perm(), err)
+	}
+	for _, want := range []string{"conftamer: enabled", "capture_id=\"unit-capture\"", "process_id=\"" + processID + "\"", "path=\"" + files[0] + "\""} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("enabled diagnostics = %q, missing %q", stderr, want)
 		}
-		if len(files) != 1 {
-			t.Fatalf("process files = %v, want exactly one", files)
-		}
-		processID := strings.TrimSuffix(filepath.Base(files[0]), ".jsonl")
-		if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(processID) {
-			t.Fatalf("process ID = %q, want 32 lowercase hex characters", processID)
-		}
-		info, err := os.Stat(files[0])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := info.Mode().Perm(); got != 0o600 {
-			t.Fatalf("process file mode = %04o, want 0600", got)
-		}
-		if !strings.Contains(stderr, "conftamer: enabled") ||
-			!strings.Contains(stderr, "capture_id=\"unit-capture\"") ||
-			!strings.Contains(stderr, "process_id=\""+processID+"\"") ||
-			!strings.Contains(stderr, "path=\""+files[0]+"\"") {
-			t.Fatalf("enabled diagnostics = %q", stderr)
-		}
-	})
+	}
 }
 
 func TestConftamerConfigurationChild(t *testing.T) {
@@ -125,10 +698,14 @@ func TestConftamerConfigurationChild(t *testing.T) {
 	}
 }
 
-func runConftamerConfigurationChild(t *testing.T, overrides map[string]string) string {
+func runConftamerConfigurationChild(t *testing.T, settings map[string]string) string {
 	t.Helper()
+	overrides := map[string]string{conftamerConfigurationChild: "1"}
+	for name, value := range settings {
+		overrides[name] = value
+	}
 	command := exec.Command(os.Args[0], "-test.run=^TestConftamerConfigurationChild$", "-test.count=1")
-	command.Env = conftamerConfigurationEnvironment(overrides)
+	command.Env = conftamerEnvironment(overrides)
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	if output, err := command.Output(); err != nil {
@@ -137,28 +714,16 @@ func runConftamerConfigurationChild(t *testing.T, overrides map[string]string) s
 	return stderr.String()
 }
 
-func conftamerConfigurationEnvironment(overrides map[string]string) []string {
-	environment := make([]string, 0, len(os.Environ())+len(overrides)+1)
+func conftamerEnvironment(overrides map[string]string) []string {
+	environment := make([]string, 0, len(os.Environ())+len(overrides))
 	for _, setting := range os.Environ() {
 		name, _, _ := strings.Cut(setting, "=")
 		if !conftamerConfigurationNames[name] {
 			environment = append(environment, setting)
 		}
 	}
-	environment = append(environment, conftamerConfigurationChild+"=1")
 	for name, value := range overrides {
 		environment = append(environment, name+"="+value)
 	}
 	return environment
-}
-
-func assertConftamerDirectoryEmpty(t *testing.T, directory string) {
-	t.Helper()
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("directory entries = %v, want empty", entries)
-	}
 }

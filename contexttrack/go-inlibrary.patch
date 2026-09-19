@@ -1,8 +1,24 @@
 diff --git a/src/net/http/h2_bundle.go b/src/net/http/h2_bundle.go
-index c440e76..83ba21c 100644
+index c440e76..e1e042c 100644
 --- a/src/net/http/h2_bundle.go
 +++ b/src/net/http/h2_bundle.go
-@@ -7698,7 +7698,8 @@ type http2ClientConn struct {
+@@ -6385,6 +6385,7 @@ func (sc *http2serverConn) handlerDone() {
+ 
+ // Run on its own goroutine.
+ func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
++	conftamerAttachServerRequest(req)
+ 	defer sc.sendServeMsg(http2handlerDoneMsg)
+ 	didPanic := true
+ 	defer func() {
+@@ -6975,6 +6976,7 @@ func (rws *http2responseWriterState) writeHeader(code int) {
+ 
+ 	rws.wroteHeader = true
+ 	rws.status = code
++	conftamerLogResponse(rws.req.conftamerExchange, "send_response", code)
+ 	if len(rws.handlerHeader) > 0 {
+ 		rws.snapHeader = http2cloneHeader(rws.handlerHeader)
+ 	}
+@@ -7698,7 +7700,8 @@ type http2ClientConn struct {
  // clientStream is the state for a single HTTP/2 stream. One of these
  // is created for each Transport.RoundTrip call.
  type http2clientStream struct {
@@ -12,6 +28,30 @@ index c440e76..83ba21c 100644
  
  	// Fields of Request that we may access even after the response body is closed.
  	ctx       context.Context
+@@ -8607,6 +8610,7 @@ func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStre
+ 	ctx := req.Context()
+ 	cs := &http2clientStream{
+ 		cc:                   cc,
++		conftamerExchange:    conftamerNewClientExchange(req),
+ 		ctx:                  ctx,
+ 		reqCancel:            req.Cancel,
+ 		isHead:               req.Method == "HEAD",
+@@ -8905,6 +8909,7 @@ func (cs *http2clientStream) encodeAndWriteHeaders(req *Request) error {
+ 	hdrs := cc.hbuf.Bytes()
+ 
+ 	// Write the request.
++	conftamerLogRequest(cs.conftamerExchange, "send_request")
+ 	endStream := !res.HasBody && !res.HasTrailers
+ 	cs.sentHeaders = true
+ 	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+@@ -9657,6 +9662,7 @@ func (rl *http2clientConnReadLoop) processHeaders(f *http2MetaHeadersFrame) erro
+ 	}
+ 	cs.resTrailer = &res.Trailer
+ 	cs.res = res
++	conftamerLogResponse(cs.conftamerExchange, "receive_response", res.StatusCode)
+ 	close(cs.respHeaderRecv)
+ 	if f.StreamEnded() {
+ 		rl.endStream(cs)
 diff --git a/src/net/http/request.go b/src/net/http/request.go
 index 167cff5..c03ff0e 100644
 --- a/src/net/http/request.go
@@ -26,8 +66,28 @@ index 167cff5..c03ff0e 100644
  	// The following fields are for requests matched by ServeMux.
  	pat         *pattern          // the pattern that matched
  	matches     []string          // values for the matching wildcards in pat
+diff --git a/src/net/http/server.go b/src/net/http/server.go
+index 6a60d94..4f4a0d4 100644
+--- a/src/net/http/server.go
++++ b/src/net/http/server.go
+@@ -1172,6 +1172,7 @@ func (w *response) WriteHeader(code int) {
+ 
+ 	w.wroteHeader = true
+ 	w.status = code
++	conftamerLogResponse(w.req.conftamerExchange, "send_response", code)
+ 
+ 	if w.calledHeader && w.cw.header == nil {
+ 		w.cw.header = w.handlerHeader.Clone()
+@@ -3298,6 +3299,7 @@ type serverHandler struct {
+ //
+ //go:linkname badServeHTTP net/http.serverHandler.ServeHTTP
+ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
++	conftamerAttachServerRequest(req)
+ 	handler := sh.srv.Handler
+ 	if handler == nil {
+ 		handler = DefaultServeMux
 diff --git a/src/net/http/transport.go b/src/net/http/transport.go
-index 26a25d2..a06c50d 100644
+index 26a25d2..b7ba31e 100644
 --- a/src/net/http/transport.go
 +++ b/src/net/http/transport.go
 @@ -520,9 +520,10 @@ func ProxyURL(fixedURL *url.URL) func(*Request) (*url.URL, error) {
@@ -44,3 +104,20 @@ index 26a25d2..a06c50d 100644
  
  	ctx    context.Context // canceled when we are done with the request
  	cancel context.CancelCauseFunc
+@@ -2572,6 +2573,7 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
+ 	}
+ 
+ 	resp.TLS = pc.tlsState
++	conftamerLogResponse(rc.treq.conftamerExchange, "receive_response", resp.StatusCode)
+ 	return
+ }
+ 
+@@ -2879,6 +2881,8 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
+ 	// request body.
+ 	startBytesWritten := pc.nwrite
+ 	writeErrCh := make(chan error, 1)
++	req.conftamerExchange = conftamerNewClientExchange(req.Request)
++	conftamerLogRequest(req.conftamerExchange, "send_request")
+ 	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+ 
+ 	resc := make(chan responseAndError)
