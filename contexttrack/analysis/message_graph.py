@@ -13,12 +13,12 @@ Run to svg: python3 contexttrack/analysis/message_graph.py --format dot | dot -T
 """
 
 import argparse
+import itertools
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 from event_io import load_events
-
 
 # message fields recorded for debugging but
 # shouldn't go into node identity/labels
@@ -63,7 +63,7 @@ def _full_pattern(orig_path: str, hop_path: str, last_pattern: str) -> str:
     slash = last_pattern.find("/")
     if slash < 0:
         # Go's parsePattern rejects a pattern with no `/` in it; this shouldn't happen
-        raise AssertionError(f"pattern without '/': {pattern}")
+        raise AssertionError(f"pattern without '/': {last_pattern}")
 
     # method+host (if any) + prefixes stripped by prev muxes + last mux's pattern
     return last_pattern[:slash] + prefix + last_pattern[slash:]
@@ -308,7 +308,7 @@ def main() -> None:
                         edges.add((ka, kb))
         else:
             keys = [k for k, _ in entries]
-            for a, b in zip(keys, keys[1:]):
+            for a, b in itertools.pairwise(keys):
                 edges.add((a, b))
 
     if not edges:

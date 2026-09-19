@@ -6,7 +6,6 @@ from pydantic import ValidationError
 
 from contexttrack.events import EVENT_ADAPTER, MessageLabel
 
-
 ROOT = Path(__file__).parents[1]
 FIXTURE = ROOT / "testdata/v2-chain.jsonl"
 SCHEMA = ROOT / "event.schema.json"

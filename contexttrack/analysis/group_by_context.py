@@ -6,12 +6,12 @@ Usage:
 """
 
 import argparse
+import itertools
 import json
 import sys
 from collections import defaultdict
 
 from event_io import load_events
-
 
 # message identifier
 # (kind, verb, path/pattern, code, api_id) tuple used for display and deduplication.
@@ -191,16 +191,16 @@ def main() -> None:
             unique_sig_counts[len(unique_idents)] += 1
 
     print(f"{'═'*66}")
-    print(f"  Group size summary — all messages (duplicates included)")
-    print(f"  (groups with identical message sets counted once)")
+    print("  Group size summary — all messages (duplicates included)")
+    print("  (groups with identical message sets counted once)")
     print(f"{'═'*66}\n")
     for size in sorted(total_sig_counts):
         print(f"  {size} message(s) = {total_sig_counts[size]} group(s)")
     print()
 
     print(f"{'═'*66}")
-    print(f"  Group size summary — unique messages per group")
-    print(f"  (groups with identical message sets counted once)")
+    print("  Group size summary — unique messages per group")
+    print("  (groups with identical message sets counted once)")
     print(f"{'═'*66}\n")
     for size in sorted(unique_sig_counts):
         print(f"  {size} message(s) = {unique_sig_counts[size]} group(s)")
@@ -216,11 +216,11 @@ def main() -> None:
             if ident not in seen_idents:
                 seen_idents.add(ident)
                 kinds_seen.append(ev.get("kind", "?"))
-        for a, b in zip(kinds_seen, kinds_seen[1:]):
+        for a, b in itertools.pairwise(kinds_seen):
             kind_pair_counts[(a, b)] += 1
 
     print(f"{'═'*66}")
-    print(f"  Kind-pair summary (consecutive pairs)")
+    print("  Kind-pair summary (consecutive pairs)")
     print(f"{'═'*66}\n")
     if not kind_pair_counts:
         print("  (no groups contain more than one unique message)\n")
@@ -243,11 +243,11 @@ def main() -> None:
                 seen.add(ident)
                 seq_idents.append(ident)
 
-        for a, b in zip(seq_idents, seq_idents[1:]):
+        for a, b in itertools.pairwise(seq_idents):
             edge_counts[(a, b)] += 1
 
     print(f"{'═'*66}")
-    print(f"  Co-occurrence pairs (consecutive only)")
+    print("  Co-occurrence pairs (consecutive only)")
     print(f"{'═'*66}\n")
 
     if not edge_counts:
