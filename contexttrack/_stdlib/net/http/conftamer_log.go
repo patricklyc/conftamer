@@ -100,6 +100,16 @@ func conftamerWriteRecord(header *conftamerEnvelope, record any) {
 	_ = log.write(header, record)
 }
 
+func conftamerFailCapture(err error) {
+	log := conftamerActiveLogger.Load()
+	if log == nil || log.stopped.Load() {
+		return
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	log.failLocked(err)
+}
+
 func conftamerValidateStrings(header *conftamerEnvelope, record any) error {
 	if err := conftamerValidateString("capture_id", header.CaptureID); err != nil {
 		return err

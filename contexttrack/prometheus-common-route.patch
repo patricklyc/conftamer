@@ -1,15 +1,14 @@
-diff --git a/home/tcr6/go/pkg/mod/github.com/prometheus/common@v0.69.0/route/route.go b/home/tcr6/common-conftamer/route/route.go
---- a/home/tcr6/go/pkg/mod/github.com/prometheus/common@v0.69.0/route/route.go
-+++ b/home/tcr6/common-conftamer/route/route.go
-@@ -74,6 +74,11 @@
+diff --git a/route/route.go b/route/route.go
+index b1f274c..ab5b9eb 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -79,6 +79,9 @@ func (r *Router) handle(handlerName string, h http.HandlerFunc) httprouter.Handl
  		h = r.instrh(handlerName, h)
  	}
  	return func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
-+		// ConfTamer: httprouter matched req.URL.Path against r.prefix+handlerName
-+		// (see the registrars below), so that string is this request's route
-+		// pattern. Logged before dispatch, as net/http's ServeMux does.
-+		http.ConftamerLogRouted(r.prefix+handlerName, req)
++		// httprouter matched req.URL.Path against this local pattern.
++		http.ConftamerLogRouted(req, "httprouter", r.prefix+handlerName)
 +
  		ctx, cancel := context.WithCancel(req.Context())
  		defer cancel()
-
+ 

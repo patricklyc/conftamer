@@ -29,8 +29,16 @@ var conftamerConfigurationNames = map[string]bool{
 	"CONFTAMER_EVENTS":          true,
 	"CONFTAMER_EVENTS_DIR":      true,
 	"CONFTAMER_CAPTURE_ID":      true,
+	"GODEBUG":                   true,
 	conftamerCaptureChild:       true,
 	conftamerConfigurationChild: true,
+}
+
+type conftamerCapturedRoute struct {
+	Dialect     string  `json:"dialect"`
+	Pattern     string  `json:"pattern"`
+	MatchedPath string  `json:"matched_path"`
+	FullPattern *string `json:"full_pattern"`
 }
 
 type conftamerCapturedRecord struct {
@@ -38,9 +46,13 @@ type conftamerCapturedRecord struct {
 	Kind       string  `json:"kind"`
 	ContextID  *uint64 `json:"context_id"`
 	Request    struct {
-		Path string `json:"path"`
+		Method string  `json:"method"`
+		Host   *string `json:"host"`
+		Path   string  `json:"path"`
 	} `json:"request"`
-	StatusCode int `json:"status_code"`
+	APIID      *string                 `json:"api_id"`
+	Route      *conftamerCapturedRoute `json:"route"`
+	StatusCode int                     `json:"status_code"`
 }
 
 type conftamerCountingBody struct {
@@ -114,6 +126,10 @@ func TestConftamerContextDisabledIsIdentity(t *testing.T) {
 	if http.ConftamerContext(ctx) != ctx || http.ConftamerContext(nil) != nil {
 		t.Fatal("disabled ConftamerContext changed its argument")
 	}
+	request := &http.Request{}
+	if http.ConftamerWithClientAPI(request, "example.org/api") != request || http.ConftamerWithClientAPI(nil, "example.org/api") != nil {
+		t.Fatal("disabled ConftamerWithClientAPI changed its argument")
+	}
 }
 
 func TestConftamerInvalidRequestEmitsNothing(t *testing.T) {
@@ -144,6 +160,9 @@ func TestConftamerAttemptLifetimes(t *testing.T) {
 		records := captureConftamerMode(t, "redirect")
 		attempts := conftamerRecords(records, "send_request", "/redirect/")
 		assertConftamerAttempts(t, records, attempts, 2)
+		if conftamerAPIValue(attempts[0]) != "example.org/redirect" || attempts[1].APIID != nil {
+			t.Fatalf("redirect API bindings = %q/%v, want explicit then unknown", conftamerAPIValue(attempts[0]), attempts[1].APIID)
+		}
 	})
 
 	t.Run("retry", func(t *testing.T) {
@@ -154,6 +173,51 @@ func TestConftamerAttemptLifetimes(t *testing.T) {
 			t.Fatalf("retried server requests = %d, want 1", got)
 		}
 	})
+}
+
+func TestConftamerRoutingAndAPIBindings(t *testing.T) {
+	records := captureConftamerMode(t, "metadata")
+	client := conftamerOnlyRecord(t, records, "send_request", "/front/items/7")
+	server := conftamerOnlyRecord(t, records, "receive_request", "/front/items/7")
+	outbound := conftamerOnlyRecord(t, records, "send_request", "/backend")
+	if conftamerAPIValue(client) != "example.org/b" || conftamerAPIValue(outbound) != "example.org/c" {
+		t.Fatalf("client/outbound API bindings = %q/%q", conftamerAPIValue(client), conftamerAPIValue(outbound))
+	}
+	if server.APIID != nil || server.ContextID == nil || conftamerContextValue(server) != conftamerContextValue(outbound) {
+		t.Fatalf("server API/context leaked or diverged: server=%v/%v outbound=%v/%v", server.APIID, server.ContextID, outbound.APIID, outbound.ContextID)
+	}
+
+	metadata := conftamerMetadataForExchange(records, server.ExchangeID)
+	if len(metadata) != 3 {
+		t.Fatalf("server metadata count = %d, want route plus two API bindings", len(metadata))
+	}
+	if route := metadata[0].Route; route == nil || route.Dialect != "go_serve_mux" || route.Pattern != "GET module-b.test/items/{id}" || route.MatchedPath != "/items/7" || route.FullPattern == nil || *route.FullPattern != "GET module-b.test/front/items/{id}" {
+		t.Fatalf("ServeMux route metadata = %+v", route)
+	}
+	for index, record := range metadata[1:] {
+		if record.Route != nil || conftamerAPIValue(record) != "example.org/b" {
+			t.Fatalf("server API metadata %d = route %+v API %q", index+1, record.Route, conftamerAPIValue(record))
+		}
+	}
+	if record := conftamerOnlyRecord(t, records, "send_request", "/front/unbound"); record.APIID != nil {
+		t.Fatalf("discarded client binding mutated its input: API = %v", record.APIID)
+	}
+	if record := conftamerOnlyRecord(t, records, "send_request", "/front/changed"); record.APIID != nil {
+		t.Fatalf("changed client target retained stale API binding: API = %v", record.APIID)
+	}
+}
+
+func TestConftamerServeMux121Routing(t *testing.T) {
+	records := captureConftamerModeWithSettings(t, "route121", map[string]string{"GODEBUG": "httpmuxgo121=1"})
+	request := conftamerOnlyRecord(t, records, "receive_request", "/legacy/item")
+	metadata := conftamerMetadataForExchange(records, request.ExchangeID)
+	if len(metadata) != 1 {
+		t.Fatalf("Go 1.21 metadata count = %d, want 1", len(metadata))
+	}
+	route := metadata[0].Route
+	if route == nil || route.Dialect != "go_serve_mux_121" || route.Pattern != "/legacy/" || route.MatchedPath != "/legacy/item" || route.FullPattern == nil || *route.FullPattern != "/legacy/" {
+		t.Fatalf("Go 1.21 route metadata = %+v", route)
+	}
 }
 
 func TestConftamerResponseLifecycles(t *testing.T) {
@@ -287,6 +351,23 @@ func conftamerContextValue(record conftamerCapturedRecord) uint64 {
 	return *record.ContextID
 }
 
+func conftamerAPIValue(record conftamerCapturedRecord) string {
+	if record.APIID == nil {
+		return ""
+	}
+	return *record.APIID
+}
+
+func conftamerMetadataForExchange(records []conftamerCapturedRecord, exchangeID uint64) []conftamerCapturedRecord {
+	var metadata []conftamerCapturedRecord
+	for _, record := range records {
+		if record.Kind == "request_metadata" && record.ExchangeID == exchangeID {
+			metadata = append(metadata, record)
+		}
+	}
+	return metadata
+}
+
 func TestConftamerCaptureChild(t *testing.T) {
 	mode := os.Getenv(conftamerCaptureChild)
 	if mode == "" {
@@ -299,12 +380,22 @@ func TestConftamerCaptureChild(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	var backendURL string
-	if mode == "nested" {
+	if mode == "nested" || mode == "metadata" {
 		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 		defer backend.Close()
 		backendURL = backend.URL
 	}
-	handler := conftamerTestHandler(t, backendURL, started)
+	var handler http.Handler
+	switch mode {
+	case "metadata":
+		handler = conftamerMetadataHandler(t, backendURL)
+	case "route121":
+		mux := http.NewServeMux()
+		mux.HandleFunc("/legacy/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+		handler = mux
+	default:
+		handler = conftamerTestHandler(t, backendURL, started)
+	}
 	server := httptest.NewServer(handler)
 	if mode == "http2" || mode == "lifecycle-http2" {
 		server.Close()
@@ -327,6 +418,10 @@ func TestConftamerCaptureChild(t *testing.T) {
 		testConftamerRedirect(t, server.URL)
 	case "retry":
 		testConftamerRetry(t, server.URL)
+	case "metadata":
+		testConftamerMetadataRequests(t, client, server.URL)
+	case "route121":
+		conftamerRequest(t, client, server.URL+"/legacy/item", http.ConftamerContext(context.Background()), false, 1)
 	case "lifecycle-http1", "lifecycle-http2":
 		paths := []string{"/empty", "/explicit", "/informational", "/implicit", "/repeated"}
 		if mode == "lifecycle-http1" {
@@ -408,6 +503,73 @@ func conftamerTestHandler(t *testing.T, backendURL string, started chan<- struct
 			w.WriteHeader(http.StatusNoContent)
 		}
 	})
+}
+
+func conftamerMetadataHandler(t *testing.T, backendURL string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET module-b.test/items/{id}", func(w http.ResponseWriter, request *http.Request) {
+		http.ConftamerSetServerAPI(request, "example.org/b")
+		http.ConftamerSetServerAPI(request, "example.org/b")
+		outbound, err := http.NewRequestWithContext(request.Context(), http.MethodGet, backendURL+"/backend", nil)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		response, err := http.DefaultClient.Do(http.ConftamerWithClientAPI(outbound, "example.org/c"))
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		response.Body.Close()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET module-b.test/unbound", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("GET module-b.test/changed", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	return http.StripPrefix("/front", mux)
+}
+
+func testConftamerMetadataRequests(t *testing.T, client *http.Client, serverURL string) {
+	do := func(request *http.Request) {
+		t.Helper()
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("metadata response status = %d", response.StatusCode)
+		}
+	}
+	newRequest := func(path string) *http.Request {
+		t.Helper()
+		request, err := http.NewRequestWithContext(http.ConftamerContext(context.Background()), http.MethodGet, serverURL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Host = "module-b.test"
+		return request
+	}
+
+	original := newRequest("/front/items/7")
+	bound := http.ConftamerWithClientAPI(original, "example.org/b")
+	if bound == original || bound.Context() != original.Context() || bound.Method != original.Method || bound.Host != original.Host || bound.URL != original.URL {
+		t.Fatal("client API helper did not return an otherwise-identical shallow copy")
+	}
+	// An annotation on an untraced request must not invent an exchange.
+	http.ConftamerSetServerAPI(&http.Request{}, "example.org/ignored")
+	do(bound)
+
+	unbound := newRequest("/front/unbound")
+	_ = http.ConftamerWithClientAPI(unbound, "example.org/b")
+	do(unbound)
+
+	changed := http.ConftamerWithClientAPI(newRequest("/front/items/8"), "example.org/b")
+	changedURL := *changed.URL
+	changedURL.Path = "/front/changed"
+	changed.URL = &changedURL
+	do(changed)
 }
 
 func testConftamerInvalidRequest(t *testing.T) {
@@ -508,6 +670,7 @@ func testConftamerRedirect(t *testing.T, serverURL string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request = http.ConftamerWithClientAPI(request, "example.org/redirect")
 	originalContext := request.Context()
 	response, err := client.Do(request)
 	if err != nil {
@@ -592,11 +755,20 @@ func conftamerRequest(t *testing.T, client *http.Client, target string, ctx cont
 
 func captureConftamerMode(t *testing.T, mode string) []conftamerCapturedRecord {
 	t.Helper()
+	return captureConftamerModeWithSettings(t, mode, nil)
+}
+
+func captureConftamerModeWithSettings(t *testing.T, mode string, settings map[string]string) []conftamerCapturedRecord {
+	t.Helper()
 	directory := t.TempDir()
-	runConftamerChild(t, mode, map[string]string{
+	captureSettings := map[string]string{
 		"CONFTAMER_EVENTS_DIR": directory,
 		"CONFTAMER_CAPTURE_ID": "unit-capture",
-	}, true)
+	}
+	for name, value := range settings {
+		captureSettings[name] = value
+	}
+	runConftamerChild(t, mode, captureSettings, true)
 	return readConftamerRecords(t, directory)
 }
 
