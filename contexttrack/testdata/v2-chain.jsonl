@@ -1,0 +1,5 @@
+{"schema_version":2,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":1,"exchange_id":1,"kind":"receive_request","context_id":7,"request":{"method":"GET","host":"module-b.test","path":"/front/42"},"api_id":null}
+{"schema_version":2,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":2,"exchange_id":1,"kind":"request_metadata","route":{"dialect":"go_serve_mux","pattern":"GET /front/{id}","matched_path":"/front/42","full_pattern":"GET /front/{id}"},"api_id":"example.org/b"}
+{"schema_version":2,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":3,"exchange_id":2,"kind":"send_request","context_id":7,"request":{"method":"GET","host":"module-c.test","path":"/back"},"api_id":"example.org/c"}
+{"schema_version":2,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":4,"exchange_id":2,"kind":"receive_response","status_code":200}
+{"schema_version":2,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":5,"exchange_id":1,"kind":"send_response","status_code":200}

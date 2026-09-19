@@ -1,11 +1,14 @@
 [project]
 name = "contexttrack"
-version = "0.1.0"
+version = "0.2.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 authors = [{ name = "Patrick Lau", email = "patricklyc@berkeley.edu" }]
-dependencies = []
+dependencies = ["pydantic>=2.13.5,<3"]
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]
 
 [project.scripts]
 contexttrack = "contexttrack:main"

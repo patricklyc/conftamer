@@ -4,6 +4,7 @@
 /test_out.log
 /result_out.log
 *.jsonl
+!/contexttrack/testdata/*.jsonl
 **/__pycache__
 /contexttrack/events
 *.svg
