@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -257,3 +258,28 @@ def read_capture(path: str | Path) -> Capture:
     records = _read_records(paths)
     exchanges = _resolve_exchanges(records)
     return Capture(tuple(records), _occurrences(records, exchanges))
+
+
+def shared_context_pairs(
+    occurrences: Iterable[Occurrence],
+) -> set[tuple[MessageLabel, MessageLabel]]:
+    groups: dict[
+        CaptureKey,
+        tuple[set[MessageLabel], set[MessageLabel]],
+    ] = {}
+    for occurrence in occurrences:
+        if occurrence.context_key is None:
+            continue
+        receives, sends = groups.setdefault(occurrence.context_key, (set(), set()))
+        destination = (
+            receives
+            if occurrence.label.kind in ("receive_request", "receive_response")
+            else sends
+        )
+        destination.add(occurrence.label)
+    return {
+        (received, sent)
+        for receives, sends in groups.values()
+        for received in receives
+        for sent in sends
+    }

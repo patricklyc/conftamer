@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from contexttrack.capture import read_capture
-from contexttrack.events import RequestEvent
+from contexttrack.capture import Occurrence, read_capture, shared_context_pairs
+from contexttrack.events import MessageLabel, RequestEvent
 
 FIXTURE = Path(__file__).parents[1] / "testdata/v2-chain.jsonl"
 PROCESS_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -382,3 +382,138 @@ def test_interleaved_identical_requests_join_reversed_responses_exactly(tmp_path
     assert [item.exchange_key[-1] for item in responses] == [11, 10]
     assert [item.label.status_code for item in responses] == [201, 202]
     assert all(item.label.host == "module-c.test" for item in responses)
+
+
+def test_chain_has_all_shared_context_pairs():
+    capture = read_capture(FIXTURE)
+
+    pairs = shared_context_pairs(capture.occurrences)
+
+    assert {(source.kind, target.kind) for source, target in pairs} == {
+        ("receive_request", "send_request"),
+        ("receive_request", "send_response"),
+        ("receive_response", "send_request"),
+        ("receive_response", "send_response"),
+    }
+    assert shared_context_pairs(reversed(capture.occurrences)) == pairs
+
+
+def message_label(kind: str, endpoint: str = "/resource") -> MessageLabel:
+    is_client = kind in ("send_request", "receive_response")
+    is_response = kind in ("send_response", "receive_response")
+    return MessageLabel.model_validate(
+        {
+            "kind": kind,
+            "api_id": None,
+            "method": "GET",
+            "host": "service.test" if is_client else None,
+            "path": endpoint,
+            "pattern": None,
+            "pattern_dialect": None,
+            "status_code": 200 if is_response else None,
+        }
+    )
+
+
+def occurrence(
+    kind: str,
+    *,
+    context_key: tuple[str, str, int] | None,
+    exchange_id: int,
+    seq: int,
+    endpoint: str = "/resource",
+) -> Occurrence:
+    capture_id = context_key[0] if context_key is not None else "capture"
+    process_id = context_key[1] if context_key is not None else PROCESS_A
+    return Occurrence(
+        label=message_label(kind, endpoint),
+        context_key=context_key,
+        exchange_key=(capture_id, process_id, exchange_id),
+        seq=seq,
+        location=f"capture.jsonl:{seq}",
+    )
+
+
+def test_shared_context_pairs_deduplicate_repeated_labels():
+    context_key = ("capture", PROCESS_A, 1)
+    sent = occurrence(
+        "send_request", context_key=context_key, exchange_id=1, seq=1
+    )
+    received = occurrence(
+        "receive_request", context_key=context_key, exchange_id=2, seq=2
+    )
+    repeated_sent = occurrence(
+        "send_request", context_key=context_key, exchange_id=3, seq=3
+    )
+
+    assert shared_context_pairs([sent, received, repeated_sent]) == {
+        (received.label, sent.label)
+    }
+
+
+def test_shared_context_pairs_include_same_exchange_receive_and_send():
+    context_key = ("capture", PROCESS_A, 1)
+    received = occurrence(
+        "receive_request", context_key=context_key, exchange_id=7, seq=1
+    )
+    sent = occurrence(
+        "send_response", context_key=context_key, exchange_id=7, seq=2
+    )
+
+    assert shared_context_pairs([received, sent]) == {
+        (received.label, sent.label)
+    }
+
+
+def test_shared_context_pairs_ignore_unknown_contexts_and_isolates():
+    unknown_received = occurrence(
+        "receive_request", context_key=None, exchange_id=1, seq=1
+    )
+    unknown_sent = occurrence(
+        "send_request", context_key=None, exchange_id=2, seq=2
+    )
+    receive_only = occurrence(
+        "receive_request",
+        context_key=("capture", PROCESS_A, 3),
+        exchange_id=3,
+        seq=3,
+    )
+    send_only = occurrence(
+        "send_request",
+        context_key=("capture", PROCESS_A, 4),
+        exchange_id=4,
+        seq=4,
+    )
+
+    assert (
+        shared_context_pairs(
+            [unknown_received, unknown_sent, receive_only, send_only]
+        )
+        == set()
+    )
+
+
+def test_shared_context_pairs_scope_reused_counters_by_capture_and_process():
+    received = occurrence(
+        "receive_request",
+        context_key=("capture-a", PROCESS_A, 1),
+        exchange_id=1,
+        seq=1,
+        endpoint="/same",
+    )
+    other_capture = occurrence(
+        "send_request",
+        context_key=("capture-b", PROCESS_A, 1),
+        exchange_id=1,
+        seq=1,
+        endpoint="/same",
+    )
+    other_process = occurrence(
+        "send_response",
+        context_key=("capture-a", PROCESS_B, 1),
+        exchange_id=1,
+        seq=1,
+        endpoint="/same",
+    )
+
+    assert shared_context_pairs([received, other_capture, other_process]) == set()
