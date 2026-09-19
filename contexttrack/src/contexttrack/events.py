@@ -9,7 +9,6 @@ from pydantic import (
     model_validator,
 )
 
-
 Counter = Annotated[int, Field(strict=True, ge=1, le=2**64 - 1)]
 Text = Annotated[str, Field(min_length=1)]
 ProcessID = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]

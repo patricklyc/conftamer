@@ -1,0 +1,2 @@
+# Nested unified diffs contain intentional context-prefix whitespace.
+*.patch -whitespace
