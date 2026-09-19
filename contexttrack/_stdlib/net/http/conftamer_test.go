@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,7 +15,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +26,7 @@ import (
 const (
 	conftamerCaptureChild       = "CONFTAMER_CAPTURE_TEST_CHILD"
 	conftamerConfigurationChild = "CONFTAMER_CONFIGURATION_TEST_CHILD"
+	conftamerParallelRequests   = 12
 )
 
 var conftamerConfigurationNames = map[string]bool{
@@ -42,10 +46,14 @@ type conftamerCapturedRoute struct {
 }
 
 type conftamerCapturedRecord struct {
-	ExchangeID uint64  `json:"exchange_id"`
-	Kind       string  `json:"kind"`
-	ContextID  *uint64 `json:"context_id"`
-	Request    struct {
+	SchemaVersion int     `json:"schema_version"`
+	CaptureID     string  `json:"capture_id"`
+	ProcessID     string  `json:"process_id"`
+	Seq           uint64  `json:"seq"`
+	ExchangeID    uint64  `json:"exchange_id"`
+	Kind          string  `json:"kind"`
+	ContextID     *uint64 `json:"context_id"`
+	Request       struct {
 		Method string  `json:"method"`
 		Host   *string `json:"host"`
 		Path   string  `json:"path"`
@@ -59,6 +67,19 @@ type conftamerCountingBody struct {
 	reader *strings.Reader
 	reads  int
 	closes int
+}
+
+type conftamerChildProcess struct {
+	command *exec.Cmd
+	stdout  bytes.Buffer
+	stderr  bytes.Buffer
+}
+
+type conftamerParallelResult struct {
+	index      int
+	statusCode int
+	protocol   int
+	err        error
 }
 
 func (body *conftamerCountingBody) Read(data []byte) (int, error) {
@@ -80,6 +101,111 @@ func (conn *conftamerFailWriteConn) Write(data []byte) (int, error) {
 		return 1, http.ExportErrServerClosedIdle
 	}
 	return conn.Conn.Write(data)
+}
+
+func TestConftamerCaptureExample(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /items/{id}", func(w http.ResponseWriter, r *http.Request) {
+		http.ConftamerSetServerAPI(r, "example.org/items")
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	ctx := http.ConftamerContext(context.Background())
+	req, err := http.NewRequestWithContext(ctx, "GET", server.URL+"/items/7", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = http.ConftamerWithClientAPI(req, "example.org/items")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+}
+
+func TestConftamerParallelAndMultiprocessCaptures(t *testing.T) {
+	directory := t.TempDir()
+	settings := map[string]string{
+		"CONFTAMER_EVENTS_DIR": directory,
+		"CONFTAMER_CAPTURE_ID": "parallel-capture",
+	}
+	enabled := runConftamerChild(t, "parallel", settings, true)
+	disabled := runConftamerChild(t, "parallel", nil, false)
+	if conftamerWorkloadMarker(t, enabled) != conftamerWorkloadMarker(t, disabled) {
+		t.Fatalf("parallel workload differs with capture enabled:\nenabled: %s\ndisabled: %s", enabled, disabled)
+	}
+	processes := readConftamerProcessRecords(t, directory)
+	if len(processes) != 1 {
+		t.Fatalf("parallel process files = %d, want 1", len(processes))
+	}
+	for processID, records := range processes {
+		assertConftamerParallelRecords(t, records, "parallel-capture", processID)
+	}
+
+	directory = t.TempDir()
+	settings = map[string]string{
+		"CONFTAMER_EVENTS_DIR": directory,
+		"CONFTAMER_CAPTURE_ID": "multiprocess-capture",
+	}
+	children := []*conftamerChildProcess{
+		newConftamerChildProcess("parallel", settings),
+		newConftamerChildProcess("parallel", settings),
+	}
+	for _, child := range children {
+		if err := child.command.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, child := range children {
+		waitConftamerChild(t, child, true)
+		if conftamerWorkloadMarker(t, child.stdout.String()) != conftamerWorkloadMarker(t, disabled) {
+			t.Fatalf("multiprocess workload differs with capture enabled: %s", child.stdout.String())
+		}
+	}
+	processes = readConftamerProcessRecords(t, directory)
+	if len(processes) != 2 {
+		t.Fatalf("shared capture process files = %d, want 2", len(processes))
+	}
+	for processID, records := range processes {
+		assertConftamerParallelRecords(t, records, "multiprocess-capture", processID)
+	}
+}
+
+func TestConftamerTimeoutRace(t *testing.T) {
+	records := captureConftamerMode(t, "timeout")
+	if len(records) != 6 {
+		t.Fatalf("timeout records = %d, want 6: %+v", len(records), records)
+	}
+	server := conftamerOnlyRecord(t, records, "receive_request", "/timeout/7")
+	if server.ContextID == nil {
+		t.Fatal("timeout server request has unknown context")
+	}
+	response := conftamerRecordForExchange(t, records, "send_response", server.ExchangeID)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("timeout response status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+	}
+	metadata := conftamerMetadataForExchange(records, server.ExchangeID)
+	if len(metadata) != 2 {
+		t.Fatalf("late timeout metadata = %d records, want route and API", len(metadata))
+	}
+	for _, record := range metadata {
+		if record.Seq <= response.Seq {
+			t.Fatalf("metadata seq = %d, want after final response seq %d", record.Seq, response.Seq)
+		}
+	}
+	if route := metadata[0].Route; route == nil || route.FullPattern == nil || *route.FullPattern != "/timeout/:id" {
+		t.Fatalf("late timeout route = %+v", route)
+	}
+	if got := conftamerAPIValue(metadata[1]); got != "example.org/timeout" {
+		t.Fatalf("late timeout API = %q", got)
+	}
 }
 
 func TestConftamerExchangeOwnership(t *testing.T) {
@@ -344,6 +470,20 @@ func conftamerOnlyRecord(t *testing.T, records []conftamerCapturedRecord, kind, 
 	return matches[0]
 }
 
+func conftamerRecordForExchange(t *testing.T, records []conftamerCapturedRecord, kind string, exchangeID uint64) conftamerCapturedRecord {
+	t.Helper()
+	var matches []conftamerCapturedRecord
+	for _, record := range records {
+		if record.Kind == kind && record.ExchangeID == exchangeID {
+			matches = append(matches, record)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("%s exchange %d records = %d, want 1", kind, exchangeID, len(matches))
+	}
+	return matches[0]
+}
+
 func conftamerContextValue(record conftamerCapturedRecord) uint64 {
 	if record.ContextID == nil {
 		return 0
@@ -379,6 +519,8 @@ func TestConftamerCaptureChild(t *testing.T) {
 	}
 
 	started := make(chan struct{}, 1)
+	timeoutRelease := make(chan struct{})
+	timeoutFinished := make(chan struct{})
 	var backendURL string
 	if mode == "nested" || mode == "metadata" {
 		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
@@ -389,6 +531,8 @@ func TestConftamerCaptureChild(t *testing.T) {
 	switch mode {
 	case "metadata":
 		handler = conftamerMetadataHandler(t, backendURL)
+	case "timeout":
+		handler = conftamerTimeoutHandler(t, started, timeoutRelease, timeoutFinished)
 	case "route121":
 		mux := http.NewServeMux()
 		mux.HandleFunc("/legacy/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
@@ -420,6 +564,10 @@ func TestConftamerCaptureChild(t *testing.T) {
 		testConftamerRetry(t, server.URL)
 	case "metadata":
 		testConftamerMetadataRequests(t, client, server.URL)
+	case "parallel":
+		testConftamerParallelWorkload(t, client, server.URL)
+	case "timeout":
+		testConftamerTimeoutWorkload(t, client, server.URL, started, timeoutRelease, timeoutFinished)
 	case "route121":
 		conftamerRequest(t, client, server.URL+"/legacy/item", http.ConftamerContext(context.Background()), false, 1)
 	case "lifecycle-http1", "lifecycle-http2":
@@ -505,6 +653,20 @@ func conftamerTestHandler(t *testing.T, backendURL string, started chan<- struct
 	})
 }
 
+func conftamerTimeoutHandler(t *testing.T, started chan<- struct{}, release <-chan struct{}, finished chan<- struct{}) http.Handler {
+	late := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		defer close(finished)
+		started <- struct{}{}
+		<-release
+		http.ConftamerLogRouted(request, "httprouter", "/timeout/:id")
+		http.ConftamerSetServerAPI(request, "example.org/timeout")
+		if _, err := io.WriteString(w, "late"); !errors.Is(err, http.ErrHandlerTimeout) {
+			t.Errorf("late timeout write error = %v, want ErrHandlerTimeout", err)
+		}
+	})
+	return http.TimeoutHandler(late, 25*time.Millisecond, "timeout")
+}
+
 func conftamerMetadataHandler(t *testing.T, backendURL string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET module-b.test/items/{id}", func(w http.ResponseWriter, request *http.Request) {
@@ -528,6 +690,103 @@ func conftamerMetadataHandler(t *testing.T, backendURL string) http.Handler {
 	mux.HandleFunc("GET module-b.test/unbound", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET module-b.test/changed", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	return http.StripPrefix("/front", mux)
+}
+
+func testConftamerParallelWorkload(t *testing.T, client *http.Client, serverURL string) {
+	results := make(chan conftamerParallelResult, conftamerParallelRequests)
+	var workers sync.WaitGroup
+	for index := range conftamerParallelRequests {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			request, err := http.NewRequestWithContext(
+				http.ConftamerContext(context.Background()),
+				http.MethodGet,
+				fmt.Sprintf("%s/parallel/%d", serverURL, index),
+				nil,
+			)
+			if err != nil {
+				results <- conftamerParallelResult{index: index, err: err}
+				return
+			}
+			originalContext := request.Context()
+			response, err := client.Do(request)
+			if err != nil {
+				results <- conftamerParallelResult{index: index, err: err}
+				return
+			}
+			_, readErr := io.Copy(io.Discard, response.Body)
+			closeErr := response.Body.Close()
+			if readErr != nil {
+				err = readErr
+			} else if closeErr != nil {
+				err = closeErr
+			} else if request.Context() != originalContext || response.Request != request {
+				err = errors.New("parallel request or context identity changed")
+			}
+			results <- conftamerParallelResult{
+				index: index, statusCode: response.StatusCode, protocol: response.ProtoMajor, err: err,
+			}
+		}()
+	}
+	workers.Wait()
+	close(results)
+
+	outcomes := make([]string, 0, conftamerParallelRequests)
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("parallel request %d: %v", result.index, result.err)
+		}
+		if result.statusCode != http.StatusNoContent || result.protocol != 1 {
+			t.Fatalf("parallel request %d status/protocol = %d/%d", result.index, result.statusCode, result.protocol)
+		}
+		outcomes = append(outcomes, fmt.Sprintf("%d:%d:%d", result.index, result.statusCode, result.protocol))
+	}
+	sort.Strings(outcomes)
+	fmt.Fprintf(os.Stdout, "conftamer-workload: %s\n", strings.Join(outcomes, ","))
+}
+
+func testConftamerTimeoutWorkload(t *testing.T, client *http.Client, serverURL string, started <-chan struct{}, release chan<- struct{}, finished <-chan struct{}) {
+	type result struct {
+		response *http.Response
+		err      error
+	}
+	request, err := http.NewRequestWithContext(
+		http.ConftamerContext(context.Background()), http.MethodGet, serverURL+"/timeout/7", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan result, 1)
+	go func() {
+		response, err := client.Do(request)
+		results <- result{response: response, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout handler did not start")
+	}
+	var outcome result
+	select {
+	case outcome = <-results:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout response was not received")
+	}
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	body, readErr := io.ReadAll(outcome.response.Body)
+	closeErr := outcome.response.Body.Close()
+	if readErr != nil || closeErr != nil || outcome.response.StatusCode != http.StatusServiceUnavailable || string(body) != "timeout" {
+		t.Fatalf("timeout response body/status/errors = %q/%d/%v/%v", body, outcome.response.StatusCode, readErr, closeErr)
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("late timeout handler did not finish")
+	}
 }
 
 func testConftamerMetadataRequests(t *testing.T, client *http.Client, serverURL string) {
@@ -772,46 +1031,128 @@ func captureConftamerModeWithSettings(t *testing.T, mode string, settings map[st
 	return readConftamerRecords(t, directory)
 }
 
-func runConftamerChild(t *testing.T, mode string, settings map[string]string, wantEnabled bool) {
+func runConftamerChild(t *testing.T, mode string, settings map[string]string, wantEnabled bool) string {
 	t.Helper()
+	child := newConftamerChildProcess(mode, settings)
+	if err := child.command.Run(); err != nil {
+		t.Fatalf("capture child failed: %v\nstdout: %s\nstderr: %s", err, child.stdout.String(), child.stderr.String())
+	}
+	waitConftamerChild(t, child, wantEnabled)
+	return child.stdout.String()
+}
+
+func newConftamerChildProcess(mode string, settings map[string]string) *conftamerChildProcess {
 	overrides := map[string]string{conftamerCaptureChild: mode}
 	for name, value := range settings {
 		overrides[name] = value
 	}
-	command := exec.Command(os.Args[0], "-test.run=^TestConftamerCaptureChild$", "-test.count=1")
-	command.Env = conftamerEnvironment(overrides)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	if output, err := command.Output(); err != nil {
-		t.Fatalf("capture child failed: %v\nstdout: %s\nstderr: %s", err, output, stderr.String())
+	child := new(conftamerChildProcess)
+	child.command = exec.Command(os.Args[0], "-test.run=^TestConftamerCaptureChild$", "-test.count=1")
+	child.command.Env = conftamerEnvironment(overrides)
+	child.command.Stdout = &child.stdout
+	child.command.Stderr = &child.stderr
+	return child
+}
+
+func waitConftamerChild(t *testing.T, child *conftamerChildProcess, wantEnabled bool) {
+	t.Helper()
+	if child.command.ProcessState == nil {
+		if err := child.command.Wait(); err != nil {
+			t.Fatalf("capture child failed: %v\nstdout: %s\nstderr: %s", err, child.stdout.String(), child.stderr.String())
+		}
+	} else if !child.command.ProcessState.Success() {
+		t.Fatalf("capture child failed:\nstdout: %s\nstderr: %s", child.stdout.String(), child.stderr.String())
 	}
-	if got := strings.Contains(stderr.String(), "conftamer: enabled"); got != wantEnabled {
-		t.Fatalf("enabled diagnostic = %t, want %t; stderr: %q", got, wantEnabled, stderr.String())
+	if got := strings.Contains(child.stderr.String(), "conftamer: enabled"); got != wantEnabled {
+		t.Fatalf("enabled diagnostic = %t, want %t; stderr: %q", got, wantEnabled, child.stderr.String())
+	}
+}
+
+func conftamerWorkloadMarker(t *testing.T, output string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "conftamer-workload: ") {
+			return line
+		}
+	}
+	t.Fatalf("workload marker missing from %q", output)
+	return ""
+}
+
+func assertConftamerParallelRecords(t *testing.T, records []conftamerCapturedRecord, captureID, processID string) {
+	t.Helper()
+	if len(records) != conftamerParallelRequests*4 {
+		t.Fatalf("process %s records = %d, want %d", processID, len(records), conftamerParallelRequests*4)
+	}
+	exchanges := make(map[uint64][]string)
+	contexts := make(map[uint64]bool)
+	for index, record := range records {
+		if record.SchemaVersion != 2 || record.CaptureID != captureID || record.ProcessID != processID || record.Seq != uint64(index+1) {
+			t.Fatalf("process %s record %d envelope = %+v", processID, index+1, record)
+		}
+		exchanges[record.ExchangeID] = append(exchanges[record.ExchangeID], record.Kind)
+		if strings.HasSuffix(record.Kind, "request") {
+			if record.ContextID == nil {
+				t.Fatalf("process %s exchange %d has unknown context", processID, record.ExchangeID)
+			}
+			contexts[*record.ContextID] = true
+		}
+	}
+	if len(exchanges) != conftamerParallelRequests*2 || len(contexts) != conftamerParallelRequests*2 {
+		t.Fatalf("process %s exchange/context counts = %d/%d, want %d/%d", processID, len(exchanges), len(contexts), conftamerParallelRequests*2, conftamerParallelRequests*2)
+	}
+	for id := uint64(1); id <= conftamerParallelRequests*2; id++ {
+		kinds := exchanges[id]
+		sort.Strings(kinds)
+		pair := strings.Join(kinds, ",")
+		if pair != "receive_request,send_response" && pair != "receive_response,send_request" {
+			t.Fatalf("process %s exchange %d kinds = %v", processID, id, kinds)
+		}
+		if !contexts[id] {
+			t.Fatalf("process %s is missing independently allocated context %d", processID, id)
+		}
 	}
 }
 
 func readConftamerRecords(t *testing.T, directory string) []conftamerCapturedRecord {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join(directory, "*.jsonl"))
-	if err != nil || len(files) != 1 {
-		t.Fatalf("process files = %v, error = %v", files, err)
+	processes := readConftamerProcessRecords(t, directory)
+	if len(processes) != 1 {
+		t.Fatalf("process files = %d, want 1", len(processes))
 	}
-	content, err := os.ReadFile(files[0])
+	for _, records := range processes {
+		return records
+	}
+	return nil
+}
+
+func readConftamerProcessRecords(t *testing.T, directory string) map[string][]conftamerCapturedRecord {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(directory, "*.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var records []conftamerCapturedRecord
-	for physicalLine, line := range bytes.Split(content, []byte{'\n'}) {
-		if len(line) == 0 {
-			continue
+	processes := make(map[string][]conftamerCapturedRecord, len(files))
+	for _, path := range files {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
 		}
-		var record conftamerCapturedRecord
-		if err := json.Unmarshal(line, &record); err != nil {
-			t.Fatalf("line %d: %v", physicalLine+1, err)
+		processID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+		var records []conftamerCapturedRecord
+		for physicalLine, line := range bytes.Split(content, []byte{'\n'}) {
+			if len(line) == 0 {
+				continue
+			}
+			var record conftamerCapturedRecord
+			if err := json.Unmarshal(line, &record); err != nil {
+				t.Fatalf("%s:%d: %v", path, physicalLine+1, err)
+			}
+			records = append(records, record)
 		}
-		records = append(records, record)
+		processes[processID] = records
 	}
-	return records
+	return processes
 }
 
 func TestConftamerConfiguration(t *testing.T) {
