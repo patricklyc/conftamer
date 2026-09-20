@@ -1,77 +1,40 @@
 diff --git a/src/net/http/h2_bundle.go b/src/net/http/h2_bundle.go
-index c440e76..e1e042c 100644
+index c440e76..899abc8 100644
 --- a/src/net/http/h2_bundle.go
 +++ b/src/net/http/h2_bundle.go
 @@ -6385,6 +6385,7 @@ func (sc *http2serverConn) handlerDone() {
  
  // Run on its own goroutine.
  func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
-+	conftamerAttachServerRequest(req)
++	conftamerFailCapture(errConftamerUnsupportedProtocol)
  	defer sc.sendServeMsg(http2handlerDoneMsg)
  	didPanic := true
  	defer func() {
-@@ -6975,6 +6976,7 @@ func (rws *http2responseWriterState) writeHeader(code int) {
+@@ -8604,6 +8605,7 @@ func (cc *http2ClientConn) RoundTrip(req *Request) (*Response, error) {
+ }
  
- 	rws.wroteHeader = true
- 	rws.status = code
-+	conftamerLogResponse(rws.req.conftamerExchange, "send_response", code)
- 	if len(rws.handlerHeader) > 0 {
- 		rws.snapHeader = http2cloneHeader(rws.handlerHeader)
- 	}
-@@ -7698,7 +7700,8 @@ type http2ClientConn struct {
- // clientStream is the state for a single HTTP/2 stream. One of these
- // is created for each Transport.RoundTrip call.
- type http2clientStream struct {
--	cc *http2ClientConn
-+	cc                *http2ClientConn
-+	conftamerExchange *conftamerExchange
- 
- 	// Fields of Request that we may access even after the response body is closed.
- 	ctx       context.Context
-@@ -8607,6 +8610,7 @@ func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStre
+ func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStream)) (*Response, error) {
++	conftamerFailCapture(errConftamerUnsupportedProtocol)
  	ctx := req.Context()
  	cs := &http2clientStream{
  		cc:                   cc,
-+		conftamerExchange:    conftamerNewClientExchange(req),
- 		ctx:                  ctx,
- 		reqCancel:            req.Cancel,
- 		isHead:               req.Method == "HEAD",
-@@ -8905,6 +8909,7 @@ func (cs *http2clientStream) encodeAndWriteHeaders(req *Request) error {
- 	hdrs := cc.hbuf.Bytes()
- 
- 	// Write the request.
-+	conftamerLogRequest(cs.conftamerExchange, "send_request")
- 	endStream := !res.HasBody && !res.HasTrailers
- 	cs.sentHeaders = true
- 	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
-@@ -9657,6 +9662,7 @@ func (rl *http2clientConnReadLoop) processHeaders(f *http2MetaHeadersFrame) erro
- 	}
- 	cs.resTrailer = &res.Trailer
- 	cs.res = res
-+	conftamerLogResponse(cs.conftamerExchange, "receive_response", res.StatusCode)
- 	close(cs.respHeaderRecv)
- 	if f.StreamEnded() {
- 		rl.endStream(cs)
 diff --git a/src/net/http/request.go b/src/net/http/request.go
-index 167cff5..5dcfa16 100644
+index 167cff5..29936d9 100644
 --- a/src/net/http/request.go
 +++ b/src/net/http/request.go
-@@ -332,6 +332,13 @@ type Request struct {
+@@ -332,6 +332,10 @@ type Request struct {
  	// and mutating the contexts held by callers of the same request.
  	ctx context.Context
  
-+	// ConfTamer state is copied by value with Request. The exchange and client
-+	// binding are immutable after publication; strippedPrefix belongs to each
-+	// native request copy made by StripPrefix.
-+	conftamerExchange       *conftamerExchange
-+	conftamerClientAPI      *conftamerClientAPIBinding
-+	conftamerStrippedPrefix string
++	// ConfTamer state is copied by value with Request and is immutable after
++	// publication to protocol workers.
++	conftamerExchange *conftamerExchange
 +
  	// The following fields are for requests matched by ServeMux.
  	pat         *pattern          // the pattern that matched
  	matches     []string          // values for the matching wildcards in pat
 diff --git a/src/net/http/server.go b/src/net/http/server.go
-index 6a60d94..819771e 100644
+index 6a60d94..4f4a0d4 100644
 --- a/src/net/http/server.go
 +++ b/src/net/http/server.go
 @@ -1172,6 +1172,7 @@ func (w *response) WriteHeader(code int) {
@@ -82,33 +45,7 @@ index 6a60d94..819771e 100644
  
  	if w.calledHeader && w.cw.header == nil {
  		w.cw.header = w.handlerHeader.Clone()
-@@ -2343,6 +2344,7 @@ func StripPrefix(prefix string, h Handler) Handler {
- 			*r2.URL = *r.URL
- 			r2.URL.Path = p
- 			r2.URL.RawPath = rp
-+			r2.conftamerStrippedPrefix += prefix
- 			h.ServeHTTP(w, r2)
- 		} else {
- 			NotFound(w, r)
-@@ -2819,9 +2821,16 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
- 	}
- 	var h Handler
- 	if use121 {
--		h, _ = mux.mux121.findHandler(r)
-+		var pattern string
-+		h, pattern = mux.mux121.findHandler(r)
-+		if pattern != "" {
-+			ConftamerLogRouted(r, "go_serve_mux_121", pattern)
-+		}
- 	} else {
- 		h, r.Pattern, r.pat, r.matches = mux.findHandler(r)
-+		if r.Pattern != "" {
-+			ConftamerLogRouted(r, "go_serve_mux", r.Pattern)
-+		}
- 	}
- 	h.ServeHTTP(w, r)
- }
-@@ -3298,6 +3307,7 @@ type serverHandler struct {
+@@ -3298,6 +3299,7 @@ type serverHandler struct {
  //
  //go:linkname badServeHTTP net/http.serverHandler.ServeHTTP
  func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {

@@ -29,27 +29,6 @@ chain to a shared root heap address; it's no longer used (false positives
 from heap-address reuse, more vulnerable to custom types) but is preserved as
 [`go-inlibrary-optional.patch`](go-inlibrary-optional.patch).
 
-### Modify Prometheus' `common` (Prometheus only)
-
-`net/http`'s hooks only see `http.ServeMux` routing. Prometheus routes its real endpoints with `prometheus/common/route` (wrapping `julienschmidt/httprouter`).
-Without this its API events get a very coarse mount point (e.g., `pattern: /api/v1/` vs. `/api/v1/query`).
-
-Apply [`prometheus-common-route.patch`](prometheus-common-route.patch) to a writable copy of the module:
-
-```bash
-cp -r ~/go/pkg/mod/github.com/prometheus/common@v0.69.0 ~/common-conftamer
-chmod -R u+w ~/common-conftamer
-cd ~/common-conftamer && patch -p4 < ~/conftamer/contexttrack/prometheus-common-route.patch
-```
-
-Then point Prometheus at it, in `~/prometheus-src/go.mod`:
-
-```
-replace github.com/prometheus/common => /path/to/common-conftamer
-```
-
-The fork calls `http.ConftamerLogRouted`, exported from the patched `net/http`.
-
 ### Set Environment Variables
 
 - **`GOTOOLCHAIN=local`** — Without it, Go's `auto` toolchain may download

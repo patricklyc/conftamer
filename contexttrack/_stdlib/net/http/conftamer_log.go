@@ -15,8 +15,9 @@ import (
 )
 
 var (
-	errConftamerInvalidUTF8 = errors.New("conftamer record contains invalid UTF-8")
-	conftamerActiveLogger   atomic.Pointer[conftamerLogger]
+	errConftamerInvalidUTF8         = errors.New("conftamer record contains invalid UTF-8")
+	errConftamerUnsupportedProtocol = errors.New("non-HTTP/1 capture is unsupported")
+	conftamerActiveLogger           atomic.Pointer[conftamerLogger]
 )
 
 type conftamerLogger struct {
@@ -56,7 +57,7 @@ func (log *conftamerLogger) write(header *conftamerEnvelope, record any) error {
 		return log.failLocked(errors.New("conftamer sequence exhausted"))
 	}
 
-	header.SchemaVersion = 2
+	header.SchemaVersion = 3
 	header.CaptureID = log.captureID
 	header.ProcessID = log.processID
 	header.Seq = log.seq + 1
@@ -129,26 +130,7 @@ func conftamerValidateStrings(header *conftamerEnvelope, record any) error {
 		if err := conftamerValidateOptionalString("request.host", event.Request.Host); err != nil {
 			return err
 		}
-		if err := conftamerValidateString("request.path", event.Request.Path); err != nil {
-			return err
-		}
-		return conftamerValidateOptionalString("api_id", event.APIID)
-	case *conftamerMetadataEvent:
-		if event.Route != nil {
-			if err := conftamerValidateString("route.dialect", event.Route.Dialect); err != nil {
-				return err
-			}
-			if err := conftamerValidateString("route.pattern", event.Route.Pattern); err != nil {
-				return err
-			}
-			if err := conftamerValidateString("route.matched_path", event.Route.MatchedPath); err != nil {
-				return err
-			}
-			if err := conftamerValidateOptionalString("route.full_pattern", event.Route.FullPattern); err != nil {
-				return err
-			}
-		}
-		return conftamerValidateOptionalString("api_id", event.APIID)
+		return conftamerValidateString("request.path", event.Request.Path)
 	}
 	return nil
 }
