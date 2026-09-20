@@ -1,107 +1,194 @@
-# ContextTrack v2 output contract
+# ContextTrack v3 output contract
 
-This document describes the executable v2 record contract in
-`src/contexttrack/events.py`. `event.schema.json` is generated from
-`EVENT_ADAPTER`; it is an interoperability artifact, not a second source of
-truth. Task 1 defines and tests the format but does not update the Go producer
-to emit it.
+This is the sole human-readable contract for the version 3 producer, reader,
+semantic labels, and possible-influence relation. The strict executable models
+are in `src/contexttrack/events.py`. Version 1 and version 2 inputs are rejected;
+no compatibility aliases, discarded legacy fields, or converter are provided.
 
-## Encoding and record variants
+## Capture and failure behavior
 
-A capture is UTF-8 JSON Lines with one complete object per nonblank physical
-line. Unknown fields, kinds, and schema versions are invalid. Invalid UTF-8 and
-escaped surrogate code points are invalid rather than repaired.
+Capture is enabled only when both settings exist before process startup:
 
-Every record has these fields:
+```text
+CONFTAMER_EVENTS_DIR=/absolute/path/to/an/existing-directory
+CONFTAMER_CAPTURE_ID=nonempty-capture-name
+```
+
+Both absent means disabled. Partial or invalid configuration disables capture
+with a diagnostic. Any set legacy `CONFTAMER_EVENTS` is an error.
+
+Each enabled process generates a random 128-bit identity, rendered as 32
+lowercase hexadecimal characters, and exclusively creates
+`<process_id>.jsonl` with mode `0600`. Files are not appended or reopened.
+
+One process-local mutex covers validation, sequence assignment, JSON encoding,
+and a checked complete-line write. Successful sequences start at 1 and are
+contiguous. The first validation, marshal, write, or short-write failure is
+diagnosed once and permanently stops that logger. Capture has no queue,
+completion record, or per-event `fsync`; a valid prefix may be incomplete.
+Synchronous logging can affect timing.
+
+Bundled HTTP/2 entry on either client or server calls the same failure path with
+`non-HTTP/1 capture is unsupported`. It does not reject the HTTP operation or
+force HTTP/1. Any such diagnostic invalidates that process capture.
+
+## Encoding and envelope
+
+A process file contains UTF-8 JSON Lines. Every nonblank physical line is one
+object. Unknown fields, kinds, and schema versions are invalid. Invalid UTF-8
+and escaped surrogate code points are rejected rather than repaired.
+
+Every record has exactly this envelope plus its variant fields:
 
 | Field | Contract |
 | --- | --- |
-| `schema_version` | the integer `2` (not `2.0`, a string, or a boolean) |
+| `schema_version` | strict integer `3` |
 | `capture_id` | nonempty string |
 | `process_id` | 32 lowercase hexadecimal characters |
-| `seq` | positive uint64 record sequence |
-| `exchange_id` | positive uint64 request/attempt identity, scoped by capture and process |
-| `kind` | one of the five kinds below |
+| `seq` | strict integer in `1..2^64-1` |
+| `exchange_id` | strict integer in `1..2^64-1` |
+| `kind` | one of the four message kinds |
 
-Counters are strict integers from 1 through `2^64 - 1`. Required nullable
-fields must be present with an explicit JSON `null` when their value is
-unknown. Fields belonging to another variant must be absent.
+Booleans, floats, and strings are not integers. Required nullable fields must be
+present as JSON `null`; fields from another variant must be absent.
 
-### Request records
+## Request records
 
 Kinds: `send_request` and `receive_request`.
 
-Additional fields:
-
 ```text
-context_id: positive uint64 or null
+context_id: strict integer in 1..2^64-1, or null
 request: {method: nonempty string, host: nonempty string or null, path: string}
-api_id: nonempty string or null
 ```
 
-A `send_request` requires a non-null host. An explicitly empty path is valid.
+A sent request requires a host. A received request may have a null host when no
+effective authority exists. The producer snapshots the method, effective HTTP
+authority, and raw `URL.Path`; an explicit empty path is valid. Authority
+spelling and ports are preserved.
 
-### Response records
+A request declares one exchange. Server ingress creates a fresh context root on
+the server-owned request. Client attempts read an inherited root or record null;
+they do not mutate caller-owned requests or create implicit roots.
 
-Kinds: `send_response` and `receive_response`.
+## Response records
 
-The only additional field is `status_code`, a strict integer. It must be the
-terminal status `101` or be in the range `200..999`. Responses refer to their
-request through the envelope's exact `exchange_id`; they do not repeat a
-request snapshot.
-
-### Metadata records
-
-Kind: `request_metadata`.
-
-Both additional fields are required and nullable, but at least one must be
-non-null:
+Kinds: `send_response` and `receive_response`. The sole variant field is:
 
 ```text
-route: {dialect, pattern, matched_path, full_pattern} or null
-api_id: nonempty string or null
+status_code: strict integer 101 or 200..999
 ```
 
-A route dialect is exactly `go_serve_mux`, `go_serve_mux_121`, or
-`httprouter`. `pattern` is nonempty, `matched_path` may be empty, and
-`full_pattern` is a nonempty string or null. Metadata describes a server
-exchange and is not a semantic message.
+A response refers to its exact request through scoped exchange identity and does
+not repeat context or request fields. `receive_response` must reference a
+preceding `send_request`; `send_response` must reference a preceding
+`receive_request`. At most one final response is allowed per exchange. A request
+without a response remains valid.
 
-## Semantic message labels
+Ordinary informational responses, bodies, trailers, cancellation, send errors,
+and completion have no record kind. An observation is not proof of peer
+delivery.
 
-`MessageLabel` is the immutable, hashable semantic key. Its fields are:
+## Identities and exact association
+
+The three identities have separate purposes:
+
+| Identity | Meaning |
+| --- | --- |
+| `(capture_id, process_id, seq)` | one record and diagnostic location |
+| `(capture_id, process_id, exchange_id)` | one server request or client attempt |
+| `(capture_id, process_id, context_id)` | one known inherited context root |
+
+Counters may repeat across processes and captures. They are not semantic graph
+nodes, transmitted trace headers, operating-system PIDs, goroutine IDs, heap
+addresses, or stable cross-run identifiers. Client and server IDs are not
+forced to match for network correlation.
+
+The reader keeps one exchange table. Each request occurrence is resolved and
+appended immediately; a response copies the exact origin's context and request
+label fields and adds response kind and status. There is no URL, FIFO, context,
+chronology, stack, or nearest-record search for an origin.
+
+## Semantic labels and occurrences
+
+`MessageLabel` is strict, frozen, and hashable, with exactly five fields:
 
 ```text
-kind, api_id, method, host, path, pattern, pattern_dialect, status_code
+kind, method, host, path, status_code
 ```
 
-Client messages (`send_request`, `receive_response`) have a host and path and
-no route pattern. Server messages (`receive_request`, `send_response`) have no
-host and have exactly one of a concrete path or a pattern paired with its
-route dialect. Requests have null status; responses have a terminal status.
-Different hosts, kinds, route dialects, and concrete-path versus pattern
-endpoints remain different keys.
+- `kind` is one of the four message kinds.
+- Client labels (`send_request`, `receive_response`) require a host.
+- Server labels (`receive_request`, `send_response`) have a null host.
+- Request labels have a null status; response labels have a terminal status.
+- An explicitly empty raw path becomes `/`; no other normalization occurs.
 
-## Cross-record invariants
+Labels contain no capture, process, exchange, context, sequence, line, module,
+API, or route identity. Equal labels can therefore deduplicate while their
+runtime occurrences remain distinct.
 
-JSON Schema cannot express all Pydantic after-validator rules, including the
-terminal-status rule, nonempty metadata, client-host requirement, and
-`MessageLabel` endpoint combinations. It also cannot establish cross-record
-integrity such as contiguous sequences, unique exchange declarations, valid
-response/metadata references, or consistent API bindings. Python consumers
-must validate lines with `EVENT_ADAPTER`; the shared reader added in a later
-task will enforce cross-record relationships.
+The retained immutable library values are:
 
-## Synthetic chain fixture
+```text
+Occurrence(label, context_key, exchange_key, seq, location)
+Capture(occurrences: tuple[Occurrence, ...])
+read_capture(path: str | Path) -> Capture
+shared_context_pairs(occurrences) -> set[(MessageLabel, MessageLabel)]
+```
 
-`testdata/v2-chain.jsonl` is the auditable five-record example:
+## Reader integrity
 
-1. receive server exchange 1 in context 7;
-2. attach its ServeMux route and API binding;
-3. send client exchange 2 in the same context;
-4. receive exchange 2's final response; and
-5. send exchange 1's final response.
+`read_capture` accepts one process file or a directory of `*.jsonl` files.
+Directory filenames are sorted for deterministic presentation, not chronology.
+The reader decodes binary physical lines as strict UTF-8, ignores blank lines
+without renumbering locations, and validates each nonblank record exactly once.
+Shape errors include `path:physical-line`; filesystem errors are preserved.
+Records are never warned-and-skipped or repaired.
 
-The fixture contains four message occurrences. The metadata record is not a
-fifth message. Both responses associate through `exchange_id`; no context,
-path, URL, or ordering heuristic is needed.
+For nonempty input it enforces:
+
+1. one capture and process identity per process file;
+2. one capture ID across a directory;
+3. one file per process identity;
+4. sequences contiguous from 1;
+5. unique request declarations;
+6. preceding response origins and correct response direction; and
+7. at most one final response per exchange.
+
+Empty files and directories, requests without responses, null contexts, and
+reused counters in different processes are valid. Passing validation proves
+internal consistency of consumed records, not capture completeness, workload
+purity, or exercised coverage.
+
+## Possible influence
+
+For every known scoped context `c`, collect received and sent semantic labels:
+
+```text
+R(c) = {receive_request, receive_response}
+S(c) = {send_request, send_response}
+E = union over c of R(c) x S(c)
+```
+
+The relation is order-independent. It has no chronology filter, URL matching,
+or same-exchange exclusion. A received response may therefore point to the
+earlier request send in its context. This overapproximates possible influence;
+it is not temporal causality.
+
+Null contexts never group. Occurrences are retained through association, then
+final labels and edges are deduplicated. Isolated labels remain visible.
+
+`testdata/v3-chain.jsonl` contains four message occurrences in one known
+context: a received server request, a sent downstream request, its received
+response, and the server's sent response. Both receives pair with both sends,
+producing exactly four edges. The unchanged v2 fixture must be rejected.
+
+## Schema and coverage limits
+
+`event.schema.json` is generated with `EVENT_ADAPTER.json_schema()`. JSON Schema
+does not express every Pydantic after-validator or any cross-record integrity
+rule. Python consumers should use `EVENT_ADAPTER` and `read_capture`.
+
+The producer observes selected standard-library HTTP/1 transitions only.
+External HTTP/2, custom transports, mocks, pre-dispatch failures, tunnels, and
+bodies may bypass it. API ownership and route patterns were deliberately
+removed. A clean diagnostic and valid records still do not prove completeness.

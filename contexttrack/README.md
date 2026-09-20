@@ -1,231 +1,133 @@
-# Context-Message Tracking
+# ContextTrack
 
-Compile context and message tracing logic directly into a cloned copy of the
-Go standard library. Any program built with this toolchain produces a `jsonl`
-file that can be used with the scripts in `analysis/`.
+ContextTrack instruments Go's standard-library HTTP/1 client and server and
+writes strict version 3 JSON Lines observations. The Python package validates a
+capture, associates each response with its exact request exchange, and displays
+possible receive-to-send influence for messages sharing a known Go context.
 
-**Goal** of this is to infer causal relationships between HTTP messages,
-i.e., "receiving this request led to sending this follow-on request."
-We define this control flow influence as two messages that share the same
-"root" context (the definition of "root" may be a bit library-specific).
+The record, label, and influence contract is in [OUTPUT.md](OUTPUT.md).
+`event.schema.json` is generated from `src/contexttrack/events.py`; it is not a
+second runtime validator. ContextTrack is an observation prototype, not proof
+of causality, delivery, complete coverage, or crash-durable capture.
 
-**TODO**: Not confident in a fair amount of this ("API ID" logic,
-where we're assigning context IDs, and where we're logging).
+## Compatibility and boundaries
 
-**TODO**: Different approach to context ID that could allow us to correlate across tests?
+Version 3 deliberately does not emit or read v1 or v2. Keep historical captures
+with their historical tooling; `testdata/v2-chain.jsonl` is retained only as a
+rejection fixture.
 
-## How to Use
+Supported observations are the standard-library HTTP/1 client transport and
+server dispatch paths. Bundled HTTP/2 client or server use diagnoses
+`non-HTTP/1 capture is unsupported` and permanently stops that process logger
+without changing HTTP negotiation or results. A capture with that diagnostic is
+unacceptable even when it contains a valid HTTP/1 prefix.
 
-### Modify Go
+External `golang.org/x/net/http2`, custom transports, mocked handlers,
+pre-dispatch protocol rejection, hijacked or tunneled traffic, and bodies are
+not covered. API ownership, route patterns, module discovery, PMGraph
+construction, Caddy integration, and Kubernetes integration are not implemented
+here.
 
-Apply [`go-inlibrary.patch`](go-inlibrary.patch) to a cloned copy of Go.
-(I directly copied the contents of `/usr/local/go` into `~/go-conftamer/`
-and applied the patch there.)
+## Requirements and setup
 
-Contexts are correlated by a monotonic ID stamped at an HTTP request's origin and
-inherited down the context chain.
-An earlier approach instead walked the context's parent
-chain to a shared root heap address; it's no longer used (false positives
-from heap-address reuse, more vulnerable to custom types) but is preserved as
-[`go-inlibrary-optional.patch`](go-inlibrary-optional.patch).
+- a clean Go `go1.26.6` Git checkout;
+- Python 3.14 or newer;
+- [`uv`](https://docs.astral.sh/uv/); and
+- Pydantic 2.13.5 or newer, below version 3 (installed by `uv`).
 
-### Set Environment Variables
-
-- **`GOTOOLCHAIN=local`** — Without it, Go's `auto` toolchain may download
-  a new fork of Go.
-- **`CONFTAMER_EVENTS=/path/to/output.jsonl`** — where events are written.
-
-Note: when running `go test`, use `-count=1` as an argument to make sure that cached
-tests get re-run. An empty output file may be caused by a missing `-count=1`.
-
-### Output
-
-The file is opened `O_APPEND`.
-Delete (or point `CONFTAMER_EVENTS` at a fresh path) between runs you want to analyze in isolation.
-
-Each line looks something like this:
-
-```json
-{"kind":"Request sent","goroutine_id":435,"file":".../net/http/transport.go","line":599,
- "message":{"req.Method":"GET","req.URL.Host":"127.0.0.1:9090","req.URL.Path":"/metrics","req.URL.RawQuery":""},
- "context":{"source":"req.Context()","type":"context.Context","context_id":"id:7"},
- "request_id":{"method":"GET","host":"127.0.0.1:9090","path":"/metrics"},"api_id":"github.com/prometheus"}
-```
-
-Kinds are `Request sent`, `Request received`, `Response sent`, `Response received`, plus
-`Request routed` (used to find the most specific `pattern` that corresponds to a
-request). Patterns therefore appear in both routers' syntaxes: `{name}` from ServeMux,
-`:name` and `*path` from httprouter.
-
-Use `analysis/group_by_context.py` to see context groups and `analysis/message_graph.py`
-to generate the full, directed grah.
-
-# Running Tests
-
-## Prometheus
-
-All tests:
+Install the local package and development dependencies:
 
 ```bash
-cd ~/prometheus-src # or Prometheus directory
-unset GOROOT   # a .bashrc-exported GOROOT silently reverts to vanilla stdlib
-export GOTOOLCHAIN=local
-export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/prom_test.jsonl
-rm -f "$CONFTAMER_EVENTS"
-
-~/go-conftamer/bin/go test -count=1 -v ./...
+uv sync --dev
 ```
 
-Or, just one test, e.g.:
+Never patch the system Go installation, a module cache, a sibling checkout, or
+an existing experiment workspace. Build in a fresh tree:
 
 ```bash
-~/go-conftamer/bin/go test ./scrape/ -run TestTargetScraperScrapeOK -count=1 -v
+REPO=$PWD
+WORK=$(mktemp -d)
+git clone --depth 1 --branch go1.26.6 https://go.googlesource.com/go "$WORK/go"
+GO_WORK=$WORK/go
+
+bash "$REPO/apply-go-patch.sh" "$GO_WORK"
+(
+  cd "$GO_WORK/src"
+  env -u GOROOT -u CONFTAMER_EVENTS -u CONFTAMER_EVENTS_DIR \
+    -u CONFTAMER_CAPTURE_ID GOTOOLCHAIN=local ./make.bash
+)
+PATCHED_GO=$GO_WORK/bin/go
+
+env -u GOROOT GOTOOLCHAIN=local "$PATCHED_GO" version
+env -u GOROOT GOTOOLCHAIN=local "$PATCHED_GO" env GOROOT
 ```
 
-**`-count=1`**: `go test` caches results; a cached package is not re-executed by
-default. This forces each test to run once.
+`apply-go-patch.sh` requires a clean `go1.26.6` Git tree, checks the native
+patch before mutation, rejects repeat application, and copies the four reviewed
+files from `_stdlib/net/http/`. Always invoke the resulting executable
+explicitly with `GOROOT` unset and `GOTOOLCHAIN=local`.
 
-**`-v`**: to see output from the test.
+## Capture one workload
 
-**Confirming the clone is linked**: Check for this line:
+Capture requires both variables before process startup:
 
+```text
+CONFTAMER_EVENTS_DIR=/absolute/path/to/an/existing-directory
+CONFTAMER_CAPTURE_ID=nonempty-run-name
 ```
-conftamer: enabled — writing "/.../prom_test.jsonl"
-```
 
-(or `conftamer: ... open failed: ...` if the output directory is missing).
+Both absent disables capture. Partial or invalid configuration, or any set
+legacy `CONFTAMER_EVENTS`, diagnoses an error and leaves capture disabled. Each
+process exclusively creates one mode-`0600` `<process_id>.jsonl` file.
 
-## Caddy
-
-**TODO**. Caddy seems to configure HTTP/2 via external `golang.org/x/net/http2`
-module cache ad sends requests through its internal `caddyhttp.(*Server).ServeHTTP`.
-So, the current hooks aren't firing.
-
-All integration tests:
+Compile with capture disabled. Enable it only while executing the selected
+binary, so toolchain and module-download traffic is excluded:
 
 ```bash
-cd ~/caddy
-unset GOROOT
-export GOTOOLCHAIN=local
-export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/caddy_test.jsonl
-rm -f "$CONFTAMER_EVENTS"
-~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/
+CAPTURE=$(mktemp -d "$WORK/capture.XXXXXX")
+
+env -u GOROOT -u CONFTAMER_EVENTS -u CONFTAMER_EVENTS_DIR \
+  -u CONFTAMER_CAPTURE_ID GOTOOLCHAIN=local "$PATCHED_GO" \
+  test -c -o "$WORK/http.test" net/http
+
+(
+  cd "$GO_WORK/src/net/http"
+  env -u GOROOT -u CONFTAMER_EVENTS GOTOOLCHAIN=local \
+    CONFTAMER_EVENTS_DIR="$CAPTURE" CONFTAMER_CAPTURE_ID=reduction-smoke \
+    "$WORK/http.test" -test.run '^TestConftamerCaptureExample$' \
+    -test.count=1 -test.v \
+    >"$WORK/capture.stdout" 2>"$WORK/capture.stderr"
+)
 ```
 
-Note: use `-p 1` to disable parallelization.
-Each integration test starts a Caddy server on the same port, so we can't
-actually execute parallel test processes.
+Inspect both output streams, the process files, record kinds, and expected
+workload activity. Successful initialization prints `conftamer: enabled` to
+stderr. A passing test, valid JSON, or an empty capture does not establish that
+capture succeeded or completed.
 
-Or, just one test, e.g.:
+Server ingress automatically creates a context root. An autonomous client must
+use the value returned by `http.ConftamerContext` to participate in influence:
+
+```go
+ctx := http.ConftamerContext(context.Background())
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+resp, err := http.DefaultClient.Do(req)
+```
+
+The helper returns the input unchanged when capture is disabled. An unstamped
+client is still recorded and associated with its response, but its context is
+null and forms no influence group.
+
+## Inspect with the sole command
+
+Pass one process file or one capture directory:
 
 ```bash
-~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/ \
-  -run TestReverseProxySubroutes
+uv run contexttrack "$CAPTURE"
+uv run contexttrack testdata/v3-chain.jsonl
 ```
 
-Unit tests:
-
-```bash
-~/go-conftamer/bin/go test -count=1 ./modules/caddyhttp/reverseproxy/
-```
-
-## Kubernetes
-
-**TODO**. I think that `make`/`hack1/*` builds and fetches a new(?) Go.
-I'm not totally clear if this messes us up.
-
-**TODO**. Running `go tests ./...` from the k8s root results in a lot of build erros.
-I'm not totally clear why. I think that it's unrelated to us.
-
-I've gotten events from the following subdirectories; I'm sure I'm missing some other
-modules that we should run on.
-
-### Staging modules (no etcd)
-
-```bash
-cd ~/kubernetes/staging/src/k8s.io/client-go
-unset GOROOT
-export GOTOOLCHAIN=local
-export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
-rm -f "$CONFTAMER_EVENTS"
-
-~/go-conftamer/bin/go test -count=1 ./transport/... ./rest/... ./tools/...
-```
-
-### B. Integration packages (need etcd)
-
-Note: `etcd` must be on `PATH` — the integration test framework calls
-`exec.LookPath("etcd")` and fails hard otherwise. If missing:
-
-```bash
-cd ~/kubernetes && hack/install-etcd.sh
-export PATH="$PATH:$HOME/kubernetes/third_party/etcd"
-```
-
-All tests in the endpoints integration package:
-
-```bash
-cd ~/kubernetes
-unset GOROOT
-export GOTOOLCHAIN=local
-export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
-rm -f "$CONFTAMER_EVENTS"
-
-~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/
-```
-
-Or, just one test, e.g.:
-
-```bash
-~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/ -run TestEndpointWithMultiplePods
-```
-
-`./test/integration/endpoints` (apiserver) is the primary package.
-
-**TODO**: other packages under `./test/integration/` might have other prereqs.
-
-# Analyzing Output
-
-Run scripts from `analysis/`
-
-```bash
-cd /home/tcr6/conftamer
-EV=contexttrack/events/caddy_test.jsonl   # or k8s_test.jsonl, prom.jsonl, ...
-
-# Text summary
-python3 contexttrack/analysis/group_by_context.py "$EV"
-
-# Graph
-python3 contexttrack/analysis/message_graph.py "$EV" --format dot | dot -Tsvg > graph.svg
-```
-
-See [`message_graph`](analysis/message_graph.py) for node/edge details.
-
-## Notes & gotchas
-
-- **Check `GOROOT`** — if the shell exports
-  `GOROOT` (e.g. `.bashrc` lines added by version managers like `g`), the patched
-  `~/go-conftamer/bin/go` compiles against that stdlib instead of its own patched
-  one. Run `unset GOROOT` first, and verify with
-  `~/go-conftamer/bin/go env GOROOT`.
-- **`GOTOOLCHAIN=local` on every invocation** — results in empty events file
-- **Stale server** (Prometheus, Caddy) — Check with `ss -tlnp | grep 9090` (Prometheus)
-  or `2999` (Caddy) and kill the stale PID.
-- **`-p 1` for Caddy integration tests** — to avoid port collisions
-- **`etcd` on `PATH`** (Kubernetes) — `framework.EtcdMain` calls
-  `exec.LookPath("etcd")` before any test runs.
-- **k8s `./...` "failures" are build failures, not test failures** — expected under
-  naive `go test ./...` and unrelated to instrumentation; scope to staging modules
-  or integration packages instead (see *Running Kubernetes tests*).
-- **504 orphan events** (Kubernetes) — the
-  `WithTimeoutForNonLongRunningRequests` filter in apiserver races the request
-  handler against a wall-clock deadline. If you see a `resp sent ... 504` with no matching `req received`, up `RequestTimeout` in
-  `staging/src/k8s.io/apiserver/pkg/server/config.go`.
-- **Append-only output** — `rm` the file between isolated runs.
-- **First run after (re)building patched `go` is slow** — any changes to the stdlib
-  require a full rebuild. `go test ./...` on a large module (e.g. all of Prometheus)
-  recompiles the whole stdlib + module graph from scratch before the first test binary starts,
-   which can take several minutes with no output in the meantime. Subsequent runs reuse the cache.
-- **Libraries:** HTTP/1.x and bundled HTTP/2 are instrumented.
-  If a test uses a mocked library, it won't work.
-- **`-count 1`** - run all tests, even if cached.
+The deterministic text output includes semantic nodes, possible-influence
+edges, and occurrence/node/edge/unknown-context counts. There are no
+subcommands, format flags, compatibility wrappers, route summaries, or DOT
+mode. Use `contexttrack.capture` when occurrence-level details are needed.
