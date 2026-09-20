@@ -1,34 +1,16 @@
 {
   "$defs": {
-    "MetadataEvent": {
+    "RequestEvent": {
       "additionalProperties": false,
       "properties": {
-        "api_id": {
-          "anyOf": [
-            {
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Api Id"
+        "schema_version": {
+          "const": 3,
+          "title": "Schema Version",
+          "type": "integer"
         },
         "capture_id": {
           "minLength": 1,
           "title": "Capture Id",
-          "type": "string"
-        },
-        "exchange_id": {
-          "maximum": 18446744073709551615,
-          "minimum": 1,
-          "title": "Exchange Id",
-          "type": "integer"
-        },
-        "kind": {
-          "const": "request_metadata",
-          "title": "Kind",
           "type": "string"
         },
         "process_id": {
@@ -36,73 +18,11 @@
           "title": "Process Id",
           "type": "string"
         },
-        "route": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Route"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "schema_version": {
-          "const": 2,
-          "title": "Schema Version",
-          "type": "integer"
-        },
         "seq": {
           "maximum": 18446744073709551615,
           "minimum": 1,
           "title": "Seq",
           "type": "integer"
-        }
-      },
-      "required": [
-        "schema_version",
-        "capture_id",
-        "process_id",
-        "seq",
-        "exchange_id",
-        "kind",
-        "route",
-        "api_id"
-      ],
-      "title": "MetadataEvent",
-      "type": "object"
-    },
-    "RequestEvent": {
-      "additionalProperties": false,
-      "properties": {
-        "api_id": {
-          "anyOf": [
-            {
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Api Id"
-        },
-        "capture_id": {
-          "minLength": 1,
-          "title": "Capture Id",
-          "type": "string"
-        },
-        "context_id": {
-          "anyOf": [
-            {
-              "maximum": 18446744073709551615,
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Context Id"
         },
         "exchange_id": {
           "maximum": 18446744073709551615,
@@ -118,24 +38,21 @@
           "title": "Kind",
           "type": "string"
         },
-        "process_id": {
-          "pattern": "^[0-9a-f]{32}$",
-          "title": "Process Id",
-          "type": "string"
+        "context_id": {
+          "anyOf": [
+            {
+              "maximum": 18446744073709551615,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Context Id"
         },
         "request": {
           "$ref": "#/$defs/RequestLabel"
-        },
-        "schema_version": {
-          "const": 2,
-          "title": "Schema Version",
-          "type": "integer"
-        },
-        "seq": {
-          "maximum": 18446744073709551615,
-          "minimum": 1,
-          "title": "Seq",
-          "type": "integer"
         }
       },
       "required": [
@@ -146,8 +63,7 @@
         "exchange_id",
         "kind",
         "context_id",
-        "request",
-        "api_id"
+        "request"
       ],
       "title": "RequestEvent",
       "type": "object"
@@ -155,6 +71,11 @@
     "RequestLabel": {
       "additionalProperties": false,
       "properties": {
+        "method": {
+          "minLength": 1,
+          "title": "Method",
+          "type": "string"
+        },
         "host": {
           "anyOf": [
             {
@@ -166,11 +87,6 @@
             }
           ],
           "title": "Host"
-        },
-        "method": {
-          "minLength": 1,
-          "title": "Method",
-          "type": "string"
         },
         "path": {
           "title": "Path",
@@ -188,10 +104,26 @@
     "ResponseEvent": {
       "additionalProperties": false,
       "properties": {
+        "schema_version": {
+          "const": 3,
+          "title": "Schema Version",
+          "type": "integer"
+        },
         "capture_id": {
           "minLength": 1,
           "title": "Capture Id",
           "type": "string"
+        },
+        "process_id": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Process Id",
+          "type": "string"
+        },
+        "seq": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
         },
         "exchange_id": {
           "maximum": 18446744073709551615,
@@ -206,22 +138,6 @@
           ],
           "title": "Kind",
           "type": "string"
-        },
-        "process_id": {
-          "pattern": "^[0-9a-f]{32}$",
-          "title": "Process Id",
-          "type": "string"
-        },
-        "schema_version": {
-          "const": 2,
-          "title": "Schema Version",
-          "type": "integer"
-        },
-        "seq": {
-          "maximum": 18446744073709551615,
-          "minimum": 1,
-          "title": "Seq",
-          "type": "integer"
         },
         "status_code": {
           "maximum": 999,
@@ -241,56 +157,12 @@
       ],
       "title": "ResponseEvent",
       "type": "object"
-    },
-    "Route": {
-      "additionalProperties": false,
-      "properties": {
-        "dialect": {
-          "enum": [
-            "go_serve_mux",
-            "go_serve_mux_121",
-            "httprouter"
-          ],
-          "title": "Dialect",
-          "type": "string"
-        },
-        "full_pattern": {
-          "anyOf": [
-            {
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Full Pattern"
-        },
-        "matched_path": {
-          "title": "Matched Path",
-          "type": "string"
-        },
-        "pattern": {
-          "minLength": 1,
-          "title": "Pattern",
-          "type": "string"
-        }
-      },
-      "required": [
-        "dialect",
-        "pattern",
-        "matched_path",
-        "full_pattern"
-      ],
-      "title": "Route",
-      "type": "object"
     }
   },
   "discriminator": {
     "mapping": {
       "receive_request": "#/$defs/RequestEvent",
       "receive_response": "#/$defs/ResponseEvent",
-      "request_metadata": "#/$defs/MetadataEvent",
       "send_request": "#/$defs/RequestEvent",
       "send_response": "#/$defs/ResponseEvent"
     },
@@ -302,9 +174,6 @@
     },
     {
       "$ref": "#/$defs/ResponseEvent"
-    },
-    {
-      "$ref": "#/$defs/MetadataEvent"
     }
   ]
 }

@@ -1,0 +1,4 @@
+{"schema_version":3,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":1,"exchange_id":1,"kind":"receive_request","context_id":7,"request":{"method":"GET","host":"module-b.test","path":"/items/7"}}
+{"schema_version":3,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":2,"exchange_id":2,"kind":"send_request","context_id":7,"request":{"method":"GET","host":"module-c.test","path":"/backend"}}
+{"schema_version":3,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":3,"exchange_id":2,"kind":"receive_response","status_code":204}
+{"schema_version":3,"capture_id":"synthetic-chain","process_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":4,"exchange_id":1,"kind":"send_response","status_code":200}

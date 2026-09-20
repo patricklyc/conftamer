@@ -5,9 +5,10 @@ from pathlib import Path
 import pytest
 
 from contexttrack.capture import Occurrence, read_capture, shared_context_pairs
-from contexttrack.events import MessageLabel, RequestEvent
+from contexttrack.events import MessageLabel
 
-FIXTURE = Path(__file__).parents[1] / "testdata/v2-chain.jsonl"
+ROOT = Path(__file__).parents[1]
+FIXTURE = ROOT / "testdata/v3-chain.jsonl"
 PROCESS_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 PROCESS_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
@@ -35,61 +36,42 @@ def assert_read_error(path: Path, *parts: str) -> str:
     return message
 
 
-def test_responses_reuse_exact_origin_labels():
+def test_v3_chain():
     capture = read_capture(FIXTURE)
-    received, sent, response_in, response_out = capture.occurrences
-    assert response_in.exchange_key == sent.exchange_key
-    assert response_out.exchange_key == received.exchange_key
-    assert response_in.label.host == "module-c.test"
-    assert response_out.label.pattern == "GET /front/{id}"
-    assert response_out.label.pattern_dialect == "go_serve_mux"
-    assert response_out.label.api_id == "example.org/b"
+    items = capture.occurrences
+    assert len(items) == 4
+    assert [item.exchange_key[2] for item in items] == [1, 2, 2, 1]
+    assert [item.label.status_code for item in items] == [None, None, 204, 200]
+    assert items[2].label.host == "module-c.test"
+    assert items[2].label.path == "/backend"
+    assert items[3].label.host is None
+    assert items[3].label.path == "/items/7"
+    indices = {item.label: index for index, item in enumerate(items)}
+    edges = {(indices[a], indices[b]) for a, b in shared_context_pairs(items)}
+    assert edges == {(0, 1), (0, 3), (2, 1), (2, 3)}
+    assert shared_context_pairs(reversed(items)) == shared_context_pairs(items)
 
 
-def test_response_reference_requires_a_declared_exchange(tmp_path):
+def test_v2_fixture_is_rejected():
+    path = ROOT / "testdata/v2-chain.jsonl"
+
+    assert_read_error(path, f"{path}:1", "schema_version")
+
+
+def test_response_reference_requires_preceding_request(tmp_path):
     records = fixture_records()
-    records[3]["exchange_id"] = 99
+    records[2]["exchange_id"] = 99
     path = write_records(tmp_path, records)
 
-    assert_read_error(path, f"{path}:4", "exchange", "99")
+    assert_read_error(path, f"{path}:3", "preceding", "exchange", "99")
 
 
-def test_response_direction_must_match_its_origin(tmp_path):
+def test_response_direction_must_match_origin(tmp_path):
     records = fixture_records()
-    records[3]["kind"] = "send_response"
+    records[2]["kind"] = "send_response"
     path = write_records(tmp_path, records)
 
-    assert_read_error(path, f"{path}:4", f"{path}:3", "send_request")
-
-
-def test_sequence_must_be_contiguous_from_one(tmp_path):
-    records = fixture_records()
-    records[2]["seq"] = 4
-    path = write_records(tmp_path, records)
-
-    assert_read_error(path, f"{path}:3", "sequence", "3", "4")
-
-
-def test_sequence_must_start_at_one(tmp_path):
-    record = fixture_records()[0]
-    record["seq"] = 2
-    path = write_records(tmp_path, [record])
-
-    assert_read_error(path, f"{path}:1", "sequence", "1", "2")
-
-
-def test_conflicting_api_binding_reports_both_locations(tmp_path):
-    records = fixture_records()
-    records[0]["api_id"] = "example.org/original"
-    path = write_records(tmp_path, records)
-
-    assert_read_error(
-        path,
-        f"{path}:2",
-        f"{path}:1",
-        "example.org/original",
-        "example.org/b",
-    )
+    assert_read_error(path, f"{path}:3", f"{path}:2", "send_request")
 
 
 def test_exchange_cannot_be_declared_twice(tmp_path):
@@ -103,65 +85,59 @@ def test_exchange_cannot_be_declared_twice(tmp_path):
 
 def test_exchange_has_at_most_one_final_response(tmp_path):
     records = fixture_records()
-    duplicate = copy.deepcopy(records[3])
-    duplicate["seq"] = 6
+    duplicate = copy.deepcopy(records[2])
+    duplicate["seq"] = 5
     path = write_records(tmp_path, [*records, duplicate])
 
-    assert_read_error(path, f"{path}:6", f"{path}:4", "final response")
+    assert_read_error(path, f"{path}:5", f"{path}:3", "final response")
 
 
-def test_response_must_follow_its_origin(tmp_path):
+def test_interleaved_requests_join_reversed_responses_exactly(tmp_path):
     records = fixture_records()
-    response = copy.deepcopy(records[3])
-    response["seq"] = 1
-    origin = copy.deepcopy(records[2])
-    origin["seq"] = 2
-    path = write_records(tmp_path, [response, origin])
+    first = records[1]
+    first.update(seq=1, exchange_id=10)
+    second = copy.deepcopy(first)
+    second.update(seq=2, exchange_id=11)
+    second_response = records[2]
+    second_response.update(seq=3, exchange_id=11, status_code=201)
+    first_response = copy.deepcopy(second_response)
+    first_response.update(seq=4, exchange_id=10, status_code=202)
+    path = write_records(
+        tmp_path, [first, second, second_response, first_response]
+    )
 
-    assert_read_error(path, f"{path}:1", "preceding", "exchange", "2")
+    responses = read_capture(path).occurrences[2:]
+
+    assert [item.exchange_key[-1] for item in responses] == [11, 10]
+    assert [item.label.status_code for item in responses] == [201, 202]
+    assert all(item.label.path == "/backend" for item in responses)
 
 
-def test_metadata_cannot_target_a_client_exchange(tmp_path):
+@pytest.mark.parametrize(("index", "seq", "expected"), [(1, 4, 2), (0, 2, 1)])
+def test_sequence_is_contiguous_from_one(tmp_path, index, seq, expected):
     records = fixture_records()
-    origin = copy.deepcopy(records[2])
-    origin["seq"] = 1
-    metadata = copy.deepcopy(records[1])
-    metadata["seq"] = 2
-    metadata["exchange_id"] = origin["exchange_id"]
-    path = write_records(tmp_path, [origin, metadata])
+    records[index]["seq"] = seq
+    path = write_records(tmp_path, records)
 
-    assert_read_error(path, f"{path}:2", f"{path}:1", "metadata", "send_request")
+    assert_read_error(path, f"{path}:{index + 1}", "sequence", str(expected), str(seq))
 
 
-def test_metadata_must_follow_its_origin(tmp_path):
-    metadata = fixture_records()[1]
-    metadata["seq"] = 1
-    path = write_records(tmp_path, [metadata])
-
-    assert_read_error(path, f"{path}:1", "preceding", "exchange", "1")
-
-
-def test_nonempty_file_has_one_capture_identity(tmp_path):
+def test_nonempty_file_has_one_capture_and_process(tmp_path):
     records = fixture_records()
     records[1]["capture_id"] = "another-capture"
-    path = write_records(tmp_path, records)
+    capture_path = write_records(tmp_path, records)
+    assert_read_error(capture_path, f"{capture_path}:2", f"{capture_path}:1", "capture")
 
-    assert_read_error(path, f"{path}:2", f"{path}:1", "capture")
-
-
-def test_nonempty_file_has_one_process_identity(tmp_path):
     records = fixture_records()
     records[1]["process_id"] = PROCESS_B
-    path = write_records(tmp_path, records)
-
-    assert_read_error(path, f"{path}:2", f"{path}:1", "process")
+    process_path = write_records(tmp_path, records, "process.jsonl")
+    assert_read_error(process_path, f"{process_path}:2", f"{process_path}:1", "process")
 
 
 def test_directory_has_one_capture_identity(tmp_path):
     first = fixture_records()[0]
     second = copy.deepcopy(first)
-    second["capture_id"] = "another-capture"
-    second["process_id"] = PROCESS_B
+    second.update(capture_id="another-capture", process_id=PROCESS_B)
     write_records(tmp_path, [first], "a.jsonl")
     second_path = write_records(tmp_path, [second], "b.jsonl")
 
@@ -173,170 +149,10 @@ def test_process_cannot_be_split_across_files(tmp_path):
     first_path = write_records(tmp_path, [record], "a.jsonl")
     second_path = write_records(tmp_path, [record], "b.jsonl")
 
-    assert_read_error(
-        tmp_path,
-        f"{first_path}:1",
-        f"{second_path}:1",
-        "process",
-    )
+    assert_read_error(tmp_path, f"{first_path}:1", f"{second_path}:1", "process")
 
 
-def test_malformed_json_reports_physical_line_after_blanks(tmp_path):
-    path = tmp_path / "capture.jsonl"
-    path.write_bytes(b"\n  \nnot-json\n")
-
-    assert_read_error(path, f"{path}:3", "invalid")
-
-
-def test_missing_field_reports_shape_error_at_location(tmp_path):
-    records = fixture_records()
-    del records[0]["context_id"]
-    path = write_records(tmp_path, records)
-
-    assert_read_error(path, f"{path}:1", "context_id", "Field required")
-
-
-def test_invalid_utf8_reports_physical_location(tmp_path):
-    path = tmp_path / "capture.jsonl"
-    line = FIXTURE.read_bytes().splitlines()[0].replace(b"synthetic", b"\xff")
-    path.write_bytes(line + b"\n")
-
-    assert_read_error(path, f"{path}:1", "utf-8")
-
-
-def test_v1_records_are_not_supported(tmp_path):
-    records = fixture_records()
-    records[0]["schema_version"] = 1
-    path = write_records(tmp_path, records[:1])
-
-    assert_read_error(path, f"{path}:1", "schema_version")
-
-
-def test_request_without_response_is_valid(tmp_path):
-    records = fixture_records()[:3]
-    path = write_records(tmp_path, records)
-
-    capture = read_capture(path)
-
-    assert [item.label.kind for item in capture.occurrences] == [
-        "receive_request",
-        "send_request",
-    ]
-
-
-def test_server_request_without_metadata_uses_concrete_path(tmp_path):
-    path = write_records(tmp_path, [fixture_records()[0]])
-
-    (occurrence,) = read_capture(path).occurrences
-
-    assert occurrence.label.path == "/front/42"
-    assert occurrence.label.pattern is None
-    assert occurrence.label.pattern_dialect is None
-
-
-def test_api_only_metadata_does_not_erase_last_route(tmp_path):
-    records = fixture_records()
-    origin = records[0]
-    route = records[1]
-    route["api_id"] = None
-    api_only = copy.deepcopy(route)
-    api_only["seq"] = 3
-    api_only["route"] = None
-    api_only["api_id"] = "example.org/b"
-    response = records[4]
-    response["seq"] = 4
-    path = write_records(tmp_path, [origin, route, api_only, response])
-
-    request, final = read_capture(path).occurrences
-
-    assert request.label.pattern == "GET /front/{id}"
-    assert final.label.pattern == "GET /front/{id}"
-    assert final.label.api_id == "example.org/b"
-
-
-def test_metadata_after_final_response_still_resolves_labels(tmp_path):
-    records = fixture_records()
-    origin = records[0]
-    response = records[4]
-    response["seq"] = 2
-    metadata = records[1]
-    metadata["seq"] = 3
-    path = write_records(tmp_path, [origin, response, metadata])
-
-    request, final = read_capture(path).occurrences
-
-    assert request.label.pattern == "GET /front/{id}"
-    assert final.label.pattern == "GET /front/{id}"
-    assert final.label.api_id == "example.org/b"
-
-
-def test_last_unverifiable_route_forces_concrete_path_fallback(tmp_path):
-    records = fixture_records()
-    unverifiable = copy.deepcopy(records[1])
-    unverifiable["seq"] = 3
-    route = unverifiable["route"]
-    assert isinstance(route, dict)
-    route["pattern"] = "GET /rewritten/{id}"
-    route["matched_path"] = "/rewritten/42"
-    route["full_pattern"] = None
-    path = write_records(tmp_path, [records[0], records[1], unverifiable])
-
-    (request,) = read_capture(path).occurrences
-
-    assert request.label.path == "/front/42"
-    assert request.label.pattern is None
-    assert request.label.pattern_dialect is None
-
-
-def test_empty_paths_are_normalized_only_in_semantic_labels(tmp_path):
-    record = fixture_records()[2]
-    request = record["request"]
-    assert isinstance(request, dict)
-    request["path"] = ""
-    record["seq"] = 1
-    path = write_records(tmp_path, [record])
-
-    capture = read_capture(path)
-    event = capture.records[0].event
-
-    assert isinstance(event, RequestEvent)
-    assert event.request.path == ""
-    assert capture.occurrences[0].label.path == "/"
-
-
-def test_unknown_context_and_api_remain_unknown(tmp_path):
-    record = fixture_records()[0]
-    record["context_id"] = None
-    record["api_id"] = None
-    path = write_records(tmp_path, [record])
-
-    (occurrence,) = read_capture(path).occurrences
-
-    assert occurrence.context_key is None
-    assert occurrence.label.api_id is None
-
-
-@pytest.mark.parametrize("as_directory", [False, True])
-def test_empty_inputs_return_empty_capture(tmp_path, as_directory):
-    path = tmp_path
-    if not as_directory:
-        path = tmp_path / "empty.jsonl"
-        path.touch()
-
-    capture = read_capture(path)
-
-    assert capture.records == ()
-    assert capture.occurrences == ()
-
-
-def test_filesystem_errors_are_not_rewritten(tmp_path):
-    missing = tmp_path / "missing.jsonl"
-
-    with pytest.raises(FileNotFoundError):
-        read_capture(missing)
-
-
-def test_same_local_ids_in_different_processes_stay_distinct(tmp_path):
+def test_same_local_ids_in_different_processes_stay_scoped(tmp_path):
     first = fixture_records()[0]
     second = copy.deepcopy(first)
     second["process_id"] = PROCESS_B
@@ -355,62 +171,89 @@ def test_same_local_ids_in_different_processes_stay_distinct(tmp_path):
     ]
 
 
-def test_interleaved_identical_requests_join_reversed_responses_exactly(tmp_path):
-    records = fixture_records()
-    first = records[2]
-    first["seq"] = 1
-    first["exchange_id"] = 10
-    second = copy.deepcopy(first)
-    second["seq"] = 2
-    second["exchange_id"] = 11
-    second_response = records[3]
-    second_response["seq"] = 3
-    second_response["exchange_id"] = 11
-    second_response["status_code"] = 201
-    first_response = copy.deepcopy(second_response)
-    first_response["seq"] = 4
-    first_response["exchange_id"] = 10
-    first_response["status_code"] = 202
-    path = write_records(
-        tmp_path,
-        [first, second, second_response, first_response],
-    )
+def test_missing_field_and_extra_field_report_location(tmp_path):
+    missing = fixture_records()[0]
+    del missing["context_id"]
+    missing_path = write_records(tmp_path, [missing])
+    assert_read_error(missing_path, f"{missing_path}:1", "context_id", "Field required")
 
-    capture = read_capture(path)
-    responses = capture.occurrences[2:]
-
-    assert [item.exchange_key[-1] for item in responses] == [11, 10]
-    assert [item.label.status_code for item in responses] == [201, 202]
-    assert all(item.label.host == "module-c.test" for item in responses)
+    extra = fixture_records()[0]
+    extra["api_id"] = None
+    extra_path = write_records(tmp_path, [extra], "extra.jsonl")
+    assert_read_error(extra_path, f"{extra_path}:1", "api_id", "Extra inputs")
 
 
-def test_chain_has_all_shared_context_pairs():
-    capture = read_capture(FIXTURE)
+def test_malformed_json_uses_physical_line_numbers(tmp_path):
+    path = tmp_path / "capture.jsonl"
+    path.write_bytes(b"\n  \nnot-json\n")
 
-    pairs = shared_context_pairs(capture.occurrences)
+    assert_read_error(path, f"{path}:3", "invalid")
 
-    assert {(source.kind, target.kind) for source, target in pairs} == {
-        ("receive_request", "send_request"),
-        ("receive_request", "send_response"),
-        ("receive_response", "send_request"),
-        ("receive_response", "send_response"),
-    }
-    assert shared_context_pairs(reversed(capture.occurrences)) == pairs
+
+@pytest.mark.parametrize("payload", [b"\xff", br"\ud800"])
+def test_invalid_utf8_and_surrogates_report_location(tmp_path, payload):
+    path = tmp_path / "capture.jsonl"
+    line = FIXTURE.read_bytes().splitlines()[0].replace(b"synthetic-chain", payload)
+    path.write_bytes(line + b"\n")
+
+    assert_read_error(path, f"{path}:1")
+
+
+def test_request_without_response_is_valid(tmp_path):
+    path = write_records(tmp_path, fixture_records()[:2])
+
+    assert [item.label.kind for item in read_capture(path).occurrences] == [
+        "receive_request",
+        "send_request",
+    ]
+
+
+def test_empty_path_is_normalized_in_semantic_label(tmp_path):
+    record = fixture_records()[1]
+    record["seq"] = 1
+    request = record["request"]
+    assert isinstance(request, dict)
+    request["path"] = ""
+    path = write_records(tmp_path, [record])
+
+    assert read_capture(path).occurrences[0].label.path == "/"
+
+
+def test_unknown_context_remains_unknown(tmp_path):
+    record = fixture_records()[0]
+    record["context_id"] = None
+    path = write_records(tmp_path, [record])
+
+    assert read_capture(path).occurrences[0].context_key is None
+
+
+@pytest.mark.parametrize("as_directory", [False, True])
+def test_empty_inputs_return_empty_capture(tmp_path, as_directory):
+    path = tmp_path
+    if not as_directory:
+        path = tmp_path / "empty.jsonl"
+        path.touch()
+
+    assert read_capture(path).occurrences == ()
+
+
+def test_filesystem_errors_are_not_rewritten(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        read_capture(tmp_path / "missing.jsonl")
 
 
 def message_label(kind: str, endpoint: str = "/resource") -> MessageLabel:
-    is_client = kind in ("send_request", "receive_response")
-    is_response = kind in ("send_response", "receive_response")
     return MessageLabel.model_validate(
         {
             "kind": kind,
-            "api_id": None,
             "method": "GET",
-            "host": "service.test" if is_client else None,
+            "host": (
+                "service.test"
+                if kind in ("send_request", "receive_response")
+                else None
+            ),
             "path": endpoint,
-            "pattern": None,
-            "pattern_dialect": None,
-            "status_code": 200 if is_response else None,
+            "status_code": 200 if kind.endswith("response") else None,
         }
     )
 
@@ -434,86 +277,68 @@ def occurrence(
     )
 
 
-def test_shared_context_pairs_deduplicate_repeated_labels():
-    context_key = ("capture", PROCESS_A, 1)
-    sent = occurrence(
-        "send_request", context_key=context_key, exchange_id=1, seq=1
-    )
+def test_pairs_deduplicate_repeated_labels():
+    context = ("capture", PROCESS_A, 1)
+    sent = occurrence("send_request", context_key=context, exchange_id=1, seq=1)
     received = occurrence(
-        "receive_request", context_key=context_key, exchange_id=2, seq=2
+        "receive_request", context_key=context, exchange_id=2, seq=2
     )
-    repeated_sent = occurrence(
-        "send_request", context_key=context_key, exchange_id=3, seq=3
-    )
+    repeated = occurrence("send_request", context_key=context, exchange_id=3, seq=3)
 
-    assert shared_context_pairs([sent, received, repeated_sent]) == {
+    assert shared_context_pairs([sent, received, repeated]) == {
         (received.label, sent.label)
     }
 
 
-def test_shared_context_pairs_include_same_exchange_receive_and_send():
-    context_key = ("capture", PROCESS_A, 1)
+def test_pairs_include_same_exchange_and_earlier_send():
+    context = ("capture", PROCESS_A, 1)
+    sent = occurrence("send_request", context_key=context, exchange_id=7, seq=1)
     received = occurrence(
-        "receive_request", context_key=context_key, exchange_id=7, seq=1
-    )
-    sent = occurrence(
-        "send_response", context_key=context_key, exchange_id=7, seq=2
+        "receive_response", context_key=context, exchange_id=7, seq=2
     )
 
-    assert shared_context_pairs([received, sent]) == {
-        (received.label, sent.label)
-    }
+    assert shared_context_pairs([sent, received]) == {(received.label, sent.label)}
 
 
-def test_shared_context_pairs_ignore_unknown_contexts_and_isolates():
-    unknown_received = occurrence(
-        "receive_request", context_key=None, exchange_id=1, seq=1
-    )
-    unknown_sent = occurrence(
-        "send_request", context_key=None, exchange_id=2, seq=2
-    )
-    receive_only = occurrence(
-        "receive_request",
-        context_key=("capture", PROCESS_A, 3),
-        exchange_id=3,
-        seq=3,
-    )
-    send_only = occurrence(
-        "send_request",
-        context_key=("capture", PROCESS_A, 4),
-        exchange_id=4,
-        seq=4,
-    )
+def test_pairs_ignore_unknown_contexts_and_isolates():
+    occurrences = [
+        occurrence("receive_request", context_key=None, exchange_id=1, seq=1),
+        occurrence("send_request", context_key=None, exchange_id=2, seq=2),
+        occurrence(
+            "receive_request",
+            context_key=("capture", PROCESS_A, 3),
+            exchange_id=3,
+            seq=3,
+        ),
+        occurrence(
+            "send_request",
+            context_key=("capture", PROCESS_A, 4),
+            exchange_id=4,
+            seq=4,
+        ),
+    ]
 
-    assert (
-        shared_context_pairs(
-            [unknown_received, unknown_sent, receive_only, send_only]
-        )
-        == set()
-    )
+    assert shared_context_pairs(occurrences) == set()
 
 
-def test_shared_context_pairs_scope_reused_counters_by_capture_and_process():
+def test_pairs_scope_reused_context_counters():
     received = occurrence(
         "receive_request",
         context_key=("capture-a", PROCESS_A, 1),
         exchange_id=1,
         seq=1,
-        endpoint="/same",
     )
     other_capture = occurrence(
         "send_request",
         context_key=("capture-b", PROCESS_A, 1),
         exchange_id=1,
         seq=1,
-        endpoint="/same",
     )
     other_process = occurrence(
         "send_response",
         context_key=("capture-a", PROCESS_B, 1),
         exchange_id=1,
         seq=1,
-        endpoint="/same",
     )
 
     assert shared_context_pairs([received, other_capture, other_process]) == set()
