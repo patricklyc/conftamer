@@ -2,7 +2,7 @@
 
 > **For agentic workers:** After explicit implementation approval, use `executing-plans`. Execute the three tasks serially and stop at their review gates. Do not delegate, commit, or push without separate authorization.
 >
-> **Status:** Proposed for review; writing this plan does not authorize implementation. It replaces the 2026-09-18 implementation scope only after approval. Do not combine both plans' feature requirements.
+> **Status:** Implemented and verified on branch `reduction`. Task 1 is commit `99ccb72`, Task 2 is `c2bc64c`, and Task 3 documentation/integration is `3f0f8be`. The unchecked boxes below preserve the approved execution recipe; the execution record near the end is authoritative for completion.
 
 **Goal:** Reduce the code and interacting behaviors a human must audit while retaining reliable HTTP/1 observations and exact shared-context influence.
 
@@ -331,6 +331,74 @@ git diff --check
 - [ ] Recount every production/test area using Section 2's method. Separately report active documentation, historical documentation, generated artifacts, and physical patch size. Inspect complete diffs/untracked files and real captures before sharing. If a budget is exceeded, stop for an explicit scope decision; do not claim this plan's estimates as achieved.
 
 **Final gate:** Present the smaller source and tests for human audit, the actual main/current/final counts, exact commands/results, both patch-application identities, the build/test tree identity, and capture counts/unknowns. Distinguish patch parsing/application, build, producer emission, reader integrity, and consumer integration. Report consumer migration and complete API/route labeling as unsupported, not completed. Return the project worktree path and a reduction-only delta relative to the preserved dirty baseline; do not automatically copy changes back over `SOURCE`. Integration, committing, and pushing require the owner's approval.
+
+## Execution record
+
+The approved reduction was completed serially without delegation. The final
+implementation is v3-only and consists of commits:
+
+- `99ccb72` — strict v3 reader, exact one-pass association, reduced labels, and
+  the sole text diagnostic;
+- `c2bc64c` — HTTP/1-only v3 producer, retained behavior/integrity tests, and
+  independent bundled-HTTP/2 capture-failure guards; and
+- `3f0f8be` — concise active documentation, archived v2 implementation notes,
+  retained plans, and the executable patch application script.
+
+Final reproduction used clean Go `go1.26.6` commit
+`1ea5a71ad8ceb7b9f16b4b6f8ea4739a4327dd6e`. The native patch parsed as 15
+additions and 3 deletions and passed `git apply --check` plus
+`apply-go-patch.sh` in two independent clean worktrees. Both applications had
+the same tracked diff hash
+`1bc7b5ca1a9505aeb3b5633d9abd3719a2e2016fb7531e1ca252c9b2af872309`.
+One application was built with `./make.bash`; the resulting executable reported
+Go 1.26.6 and its fresh-tree `GOROOT`.
+
+Final producer verification passed:
+
+```text
+go test -count=1 net/http -run '^TestConftamer'
+go test -race -count=1 net/http -run '^TestConftamer'
+go test -count=1 net/http
+```
+
+The independent HTTP/2 client/server boundary cases and the nested
+server-root-to-outbound-request inheritance case also passed explicitly. A test
+binary compiled with capture disabled, then ran the capture example with capture
+enabled only during execution. The fresh mode-0600 process file contained
+exactly four schema-v3 records, one of each message kind. Its diagnostic had
+four occurrences, four nodes, two context-local edges, and
+`unknown_context=0`; stderr contained one enablement line and no failure. The
+synthetic forwarding fixture had four nodes, four edges, and
+`unknown_context=0`. Client and server runtime roots remained distinct; no IDs
+were forced to match. API/route enrichment is absent by design, not an observed
+zero-unknown metric.
+
+Final repository verification passed with 88 Python tests, Ruff, ty, patch
+parsing, and `git diff --check`. Physical-line counts were:
+
+| Area | Main | Pre-reduction v2 | Final v3 |
+| --- | ---: | ---: | ---: |
+| Go producer/writer/native additions | 435 | 576 | 391 |
+| Prometheus adapter additions | 5 | 3 | 0 |
+| Python models/reader/diagnostic | 683 | 644 | 386 |
+| Patch application script | 0 | 66 | 66 |
+| **Production** | **1,123** | **1,289** | **843** |
+| Go tests | 0 | 1,582 | 1,200 |
+| Python tests | 0 | 1,109 | 748 |
+| **Code plus tests** | **1,123** | **3,980** | **2,791** |
+
+Production fell 34.6% and code plus tests fell 29.9% relative to v2. Active
+documentation is 399 lines; historical documentation is 2,235 lines; generated
+schema/fixtures/lockfile are 357 lines; and the native patch is 90 physical
+lines. All approved budgets were met. `README.md`, `OUTPUT.md`, and `AGENTS.md`
+are the active guides; `docs/history/contexttrack-v2-implementation.md` and the
+plans are historical. The v2 implementation document's unchanged SHA-256 is
+`a427621dd0cf90c2a55c6cfce266611529ef929bc5cfe0290cb69b956081a39f`.
+
+The reduction was copied into the `reduction` branch and committed. Consumer
+migration, v1/v2 conversion, complete API/route labeling, bundled-HTTP/2
+capture, external HTTP/2, custom transports, Caddy, and Kubernetes remain
+unsupported or separate work.
 
 ## Planning evidence and residual risks
 
