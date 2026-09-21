@@ -1,28 +1,82 @@
 package http
 
 import (
-	"context"
+	"errors"
+	"sort"
+	"sync"
 	"sync/atomic"
 )
 
 var (
-	conftamerContextCounter  atomic.Uint64
-	conftamerExchangeCounter atomic.Uint64
+	conftamerExchangeCounter         atomic.Uint64
+	errConftamerInvalidRequest       = errors.New("conftamer request annotation target is nil")
+	errConftamerInvalidSource        = errors.New("conftamer source was not observed as a receive")
+	errConftamerInvalidReplyTarget   = errors.New("conftamer reply target was not observed as a server request")
+	errConftamerLateReplyDeclaration = errors.New("reply sources declared after final headers")
 )
 
-type conftamerContextKey struct{}
+// ConftamerSource is an HTTP request or response observed as a receive by an
+// enabled ConfTamer capture. Only *Request and *Response implement this
+// interface.
+type ConftamerSource interface {
+	conftamerReceiveSeq() uint64
+}
 
-// ConftamerContext returns a context carrying a new capture-local root. It
-// returns ctx unchanged when capture is disabled or the context already has a
-// root. Callers must use the returned context. A nil context remains nil.
-func ConftamerContext(ctx context.Context) context.Context {
-	if ctx == nil || !conftamerCaptureEnabled() {
-		return ctx
+func (req *Request) conftamerReceiveSeq() uint64 {
+	if req == nil {
+		return 0
 	}
-	if _, ok := conftamerContextID(ctx); ok {
-		return ctx
+	return req.conftamerReceiveSequence
+}
+
+func (resp *Response) conftamerReceiveSeq() uint64 {
+	if resp == nil {
+		return 0
 	}
-	return context.WithValue(ctx, conftamerContextKey{}, conftamerContextCounter.Add(1))
+	return resp.conftamerReceiveSequence
+}
+
+// ConftamerWithSources returns a shallow copy of req whose complete declared
+// source list is sources. It returns req unchanged when capture is disabled or
+// stopped. Invalid declarations fail capture without changing req.
+func ConftamerWithSources(req *Request, sources ...ConftamerSource) *Request {
+	if !conftamerCaptureEnabled() {
+		return req
+	}
+	if req == nil {
+		conftamerFailCapture(errConftamerInvalidRequest)
+		return req
+	}
+	sequences, ok := conftamerSourceSequences(sources)
+	if !ok {
+		conftamerFailCapture(errConftamerInvalidSource)
+		return req
+	}
+	annotated := new(Request)
+	*annotated = *req
+	annotated.conftamerSources = sequences
+	return annotated
+}
+
+// ConftamerSetReplySources replaces the additional declared sources for the
+// reply associated with req. The received req is always an automatic source.
+// Declarations after final headers fail capture without changing the reply.
+func ConftamerSetReplySources(req *Request, sources ...ConftamerSource) {
+	if !conftamerCaptureEnabled() {
+		return
+	}
+	if req == nil || req.conftamerExchange == nil || req.conftamerReceiveSequence == 0 || req.conftamerReply == nil {
+		conftamerFailCapture(errConftamerInvalidReplyTarget)
+		return
+	}
+	sequences, ok := conftamerSourceSequences(sources)
+	if !ok {
+		conftamerFailCapture(errConftamerInvalidSource)
+		return
+	}
+	if !req.conftamerReply.set(sequences) {
+		conftamerFailCapture(errConftamerLateReplyDeclaration)
+	}
 }
 
 func conftamerCaptureEnabled() bool {
@@ -30,12 +84,34 @@ func conftamerCaptureEnabled() bool {
 	return log != nil && !log.stopped.Load()
 }
 
-func conftamerContextID(ctx context.Context) (uint64, bool) {
-	if ctx == nil {
-		return 0, false
+func conftamerSourceSequences(sources []ConftamerSource) ([]uint64, bool) {
+	sequences := make([]uint64, 0, len(sources))
+	for _, source := range sources {
+		if source == nil {
+			return nil, false
+		}
+		sequence := source.conftamerReceiveSeq()
+		if sequence == 0 {
+			return nil, false
+		}
+		sequences = append(sequences, sequence)
 	}
-	id, ok := ctx.Value(conftamerContextKey{}).(uint64)
-	return id, ok && id != 0
+	return conftamerCanonicalSources(sequences), true
+}
+
+func conftamerCanonicalSources(sources []uint64) []uint64 {
+	canonical := append([]uint64(nil), sources...)
+	sort.Slice(canonical, func(left, right int) bool { return canonical[left] < canonical[right] })
+	unique := canonical[:0]
+	for _, source := range canonical {
+		if len(unique) == 0 || unique[len(unique)-1] != source {
+			unique = append(unique, source)
+		}
+	}
+	if unique == nil {
+		return []uint64{}
+	}
+	return unique
 }
 
 func conftamerAttachServerRequest(req *Request) {
@@ -46,26 +122,28 @@ func conftamerAttachServerRequest(req *Request) {
 		conftamerFailCapture(errConftamerUnsupportedProtocol)
 		return
 	}
-	contextID := conftamerContextCounter.Add(1)
-	req.ctx = context.WithValue(req.Context(), conftamerContextKey{}, contextID)
-	exchange := conftamerNewExchange(req, contextID)
+	exchange := conftamerNewExchange(req, nil)
+	sequence := conftamerLogRequest(exchange, "receive_request")
+	if sequence == 0 {
+		return
+	}
 	req.conftamerExchange = exchange
-	conftamerLogRequest(exchange, "receive_request")
+	req.conftamerReceiveSequence = sequence
+	req.conftamerReply = new(conftamerReplySources)
 }
 
 func conftamerNewClientExchange(req *Request) *conftamerExchange {
 	if !conftamerCaptureEnabled() {
 		return nil
 	}
-	contextID, _ := conftamerContextID(req.Context())
-	return conftamerNewExchange(req, contextID)
+	return conftamerNewExchange(req, req.conftamerSources)
 }
 
-func conftamerNewExchange(req *Request, contextID uint64) *conftamerExchange {
+func conftamerNewExchange(req *Request, sources []uint64) *conftamerExchange {
 	return &conftamerExchange{
-		id:        conftamerExchangeCounter.Add(1),
-		contextID: contextID,
-		request:   conftamerRequestSnapshot(req),
+		id:      conftamerExchangeCounter.Add(1),
+		request: conftamerRequestSnapshot(req),
+		sources: conftamerCanonicalSources(sources),
 	}
 }
 
@@ -89,42 +167,45 @@ func conftamerRequestSnapshot(req *Request) conftamerRequestLabel {
 	return conftamerRequestLabel{Method: method, Host: hostPointer, Path: path}
 }
 
-func conftamerLogRequest(exchange *conftamerExchange, kind string) {
+func conftamerLogRequest(exchange *conftamerExchange, kind string) uint64 {
 	if exchange == nil {
-		return
+		return 0
 	}
-	var contextID *uint64
-	if exchange.contextID != 0 {
-		value := exchange.contextID
-		contextID = &value
-	}
-	event := conftamerRequestEvent{
-		ContextID: contextID,
-		Request:   exchange.request,
-	}
+	event := conftamerRequestEvent{Request: exchange.request}
 	event.ExchangeID = exchange.id
 	event.Kind = kind
-	conftamerWriteRecord(&event.conftamerEnvelope, &event)
+	event.Sources = conftamerCanonicalSources(exchange.sources)
+	return conftamerWriteRecord(&event.conftamerEnvelope, &event)
 }
 
-func conftamerLogResponse(exchange *conftamerExchange, kind string, statusCode int) {
+func conftamerLogResponse(exchange *conftamerExchange, kind string, statusCode int, sources []uint64) uint64 {
 	if exchange == nil {
-		return
+		return 0
 	}
 	event := conftamerResponseEvent{StatusCode: statusCode}
 	event.ExchangeID = exchange.id
 	event.Kind = kind
-	conftamerWriteRecord(&event.conftamerEnvelope, &event)
+	event.Sources = conftamerCanonicalSources(sources)
+	return conftamerWriteRecord(&event.conftamerEnvelope, &event)
+}
+
+func conftamerLogServerResponse(req *Request, statusCode int) {
+	if req == nil || req.conftamerExchange == nil || req.conftamerReply == nil {
+		return
+	}
+	sources := req.conftamerReply.freeze(req.conftamerReceiveSequence)
+	conftamerLogResponse(req.conftamerExchange, "send_response", statusCode, sources)
 }
 
 // conftamerEnvelope identifies one record within a capture process.
 type conftamerEnvelope struct {
-	SchemaVersion int    `json:"schema_version"`
-	CaptureID     string `json:"capture_id"`
-	ProcessID     string `json:"process_id"`
-	Seq           uint64 `json:"seq"`
-	ExchangeID    uint64 `json:"exchange_id"`
-	Kind          string `json:"kind"`
+	SchemaVersion int      `json:"schema_version"`
+	CaptureID     string   `json:"capture_id"`
+	ProcessID     string   `json:"process_id"`
+	Seq           uint64   `json:"seq"`
+	ExchangeID    uint64   `json:"exchange_id"`
+	Kind          string   `json:"kind"`
+	Sources       []uint64 `json:"sources"`
 }
 
 type conftamerRequestLabel struct {
@@ -135,8 +216,7 @@ type conftamerRequestLabel struct {
 
 type conftamerRequestEvent struct {
 	conftamerEnvelope
-	ContextID *uint64               `json:"context_id"`
-	Request   conftamerRequestLabel `json:"request"`
+	Request conftamerRequestLabel `json:"request"`
 }
 
 type conftamerResponseEvent struct {
@@ -145,9 +225,34 @@ type conftamerResponseEvent struct {
 }
 
 // conftamerExchange is immutable after publication to HTTP protocol workers.
-// A zero contextID means that the request had no stamped context root.
 type conftamerExchange struct {
-	id        uint64
-	contextID uint64
-	request   conftamerRequestLabel
+	id      uint64
+	request conftamerRequestLabel
+	sources []uint64
+}
+
+type conftamerReplySources struct {
+	mu      sync.Mutex
+	sources []uint64
+	frozen  bool
+}
+
+func (reply *conftamerReplySources) set(sources []uint64) bool {
+	reply.mu.Lock()
+	defer reply.mu.Unlock()
+	if reply.frozen {
+		return false
+	}
+	reply.sources = sources
+	return true
+}
+
+func (reply *conftamerReplySources) freeze(requestSequence uint64) []uint64 {
+	reply.mu.Lock()
+	defer reply.mu.Unlock()
+	reply.frozen = true
+	sources := make([]uint64, 0, len(reply.sources)+1)
+	sources = append(sources, reply.sources...)
+	sources = append(sources, requestSequence)
+	return conftamerCanonicalSources(sources)
 }

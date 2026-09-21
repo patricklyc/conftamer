@@ -19,29 +19,46 @@ index c440e76..899abc8 100644
  	cs := &http2clientStream{
  		cc:                   cc,
 diff --git a/src/net/http/request.go b/src/net/http/request.go
-index 167cff5..29936d9 100644
+index 167cff5..78b6282 100644
 --- a/src/net/http/request.go
 +++ b/src/net/http/request.go
-@@ -332,6 +332,10 @@ type Request struct {
+@@ -332,6 +332,13 @@ type Request struct {
  	// and mutating the contexts held by callers of the same request.
  	ctx context.Context
  
-+	// ConfTamer state is copied by value with Request and is immutable after
-+	// publication to protocol workers.
-+	conftamerExchange *conftamerExchange
++	// ConfTamer request annotations are immutable after publication to protocol
++	// workers. The reply slot is shared by server request copies.
++	conftamerExchange        *conftamerExchange
++	conftamerReceiveSequence uint64
++	conftamerSources         []uint64
++	conftamerReply           *conftamerReplySources
 +
  	// The following fields are for requests matched by ServeMux.
  	pat         *pattern          // the pattern that matched
  	matches     []string          // values for the matching wildcards in pat
+diff --git a/src/net/http/response.go b/src/net/http/response.go
+index 0c3d7f6..5ce7630 100644
+--- a/src/net/http/response.go
++++ b/src/net/http/response.go
+@@ -119,6 +119,9 @@ type Response struct {
+ 	// The pointer is shared between responses and should not be
+ 	// modified.
+ 	TLS *tls.ConnectionState
++
++	// conftamerReceiveSequence identifies an observed client response.
++	conftamerReceiveSequence uint64
+ }
+ 
+ // Cookies parses and returns the cookies set in the Set-Cookie headers.
 diff --git a/src/net/http/server.go b/src/net/http/server.go
-index 6a60d94..4f4a0d4 100644
+index 6a60d94..d80977e 100644
 --- a/src/net/http/server.go
 +++ b/src/net/http/server.go
 @@ -1172,6 +1172,7 @@ func (w *response) WriteHeader(code int) {
  
  	w.wroteHeader = true
  	w.status = code
-+	conftamerLogResponse(w.req.conftamerExchange, "send_response", code)
++	conftamerLogServerResponse(w.req, code)
  
  	if w.calledHeader && w.cw.header == nil {
  		w.cw.header = w.handlerHeader.Clone()
@@ -54,7 +71,7 @@ index 6a60d94..4f4a0d4 100644
  	if handler == nil {
  		handler = DefaultServeMux
 diff --git a/src/net/http/transport.go b/src/net/http/transport.go
-index 26a25d2..b7ba31e 100644
+index 26a25d2..56a5b53 100644
 --- a/src/net/http/transport.go
 +++ b/src/net/http/transport.go
 @@ -520,9 +520,10 @@ func ProxyURL(fixedURL *url.URL) func(*Request) (*url.URL, error) {
@@ -75,7 +92,7 @@ index 26a25d2..b7ba31e 100644
  	}
  
  	resp.TLS = pc.tlsState
-+	conftamerLogResponse(rc.treq.conftamerExchange, "receive_response", resp.StatusCode)
++	resp.conftamerReceiveSequence = conftamerLogResponse(rc.treq.conftamerExchange, "receive_response", resp.StatusCode, nil)
  	return
  }
  

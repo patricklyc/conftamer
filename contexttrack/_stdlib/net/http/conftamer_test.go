@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -41,13 +42,13 @@ var conftamerConfigurationNames = map[string]bool{
 }
 
 type conftamerCapturedRecord struct {
-	SchemaVersion int     `json:"schema_version"`
-	CaptureID     string  `json:"capture_id"`
-	ProcessID     string  `json:"process_id"`
-	Seq           uint64  `json:"seq"`
-	ExchangeID    uint64  `json:"exchange_id"`
-	Kind          string  `json:"kind"`
-	ContextID     *uint64 `json:"context_id"`
+	SchemaVersion int      `json:"schema_version"`
+	CaptureID     string   `json:"capture_id"`
+	ProcessID     string   `json:"process_id"`
+	Seq           uint64   `json:"seq"`
+	ExchangeID    uint64   `json:"exchange_id"`
+	Kind          string   `json:"kind"`
+	Sources       []uint64 `json:"sources"`
 	Request       struct {
 		Path string `json:"path"`
 	} `json:"request"`
@@ -116,7 +117,7 @@ func TestConftamerCaptureExample(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	conftamerRequest(t, http.DefaultClient, server.URL+"/items/7",
-		http.ConftamerContext(context.Background()), false, http.StatusOK, 1)
+		context.Background(), false, http.StatusOK, 1)
 }
 
 func TestConftamerParallelAndMultiprocessCaptures(t *testing.T) {
@@ -173,12 +174,58 @@ func TestConftamerTimeoutRace(t *testing.T) {
 		t.Fatalf("timeout records = %d, want 4: %+v", len(records), records)
 	}
 	server := conftamerOnlyRecord(t, records, "receive_request", "/timeout/7", 0)
-	if server.ContextID == nil {
-		t.Fatal("timeout server request has unknown context")
-	}
 	response := conftamerOnlyRecord(t, records, "send_response", "", server.ExchangeID)
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("timeout response status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+	if response.StatusCode != http.StatusServiceUnavailable || !slices.Equal(response.Sources, []uint64{server.Seq}) {
+		t.Fatalf("timeout response status/sources = %d/%v, want %d/[%d]", response.StatusCode, response.Sources, http.StatusServiceUnavailable, server.Seq)
+	}
+}
+
+func TestConftamerSourceDeclarations(t *testing.T) {
+	records := captureConftamerMode(t, "sources")
+	if len(records) != 12 {
+		t.Fatalf("source records = %d, want 12: %+v", len(records), records)
+	}
+	incoming := conftamerOnlyRecord(t, records, "receive_request", "/sources", 0)
+	sourceSend := conftamerOnlyRecord(t, records, "send_request", "/backend/source", 0)
+	sourceResponse := conftamerOnlyRecord(t, records, "receive_response", "", sourceSend.ExchangeID)
+	sinkSend := conftamerOnlyRecord(t, records, "send_request", "/backend/sink", 0)
+	sinkResponse := conftamerOnlyRecord(t, records, "receive_response", "", sinkSend.ExchangeID)
+	reply := conftamerOnlyRecord(t, records, "send_response", "", incoming.ExchangeID)
+
+	if !slices.Equal(sinkSend.Sources, []uint64{incoming.Seq, sourceResponse.Seq}) {
+		t.Fatalf("sink sources = %v, want [%d %d]", sinkSend.Sources, incoming.Seq, sourceResponse.Seq)
+	}
+	if !slices.Equal(reply.Sources, []uint64{incoming.Seq, sourceResponse.Seq, sinkResponse.Seq}) {
+		t.Fatalf("reply sources = %v, want [%d %d %d]", reply.Sources, incoming.Seq, sourceResponse.Seq, sinkResponse.Seq)
+	}
+	if len(sourceResponse.Sources) != 0 || len(sinkResponse.Sources) != 0 {
+		t.Fatalf("received responses inherited sources: %v/%v", sourceResponse.Sources, sinkResponse.Sources)
+	}
+}
+
+func TestConftamerReplySourceCutoff(t *testing.T) {
+	t.Run("informational header does not freeze", func(t *testing.T) {
+		records, stderr := captureConftamerModeResult(t, "informational-sources")
+		if strings.Contains(stderr, "capture failed:") || len(records) != 4 {
+			t.Fatalf("records/stderr = %v/%q", records, stderr)
+		}
+		request := conftamerOnlyRecord(t, records, "receive_request", "/informational-sources", 0)
+		reply := conftamerOnlyRecord(t, records, "send_response", "", request.ExchangeID)
+		if !slices.Equal(reply.Sources, []uint64{request.Seq}) {
+			t.Fatalf("reply sources = %v, want [%d]", reply.Sources, request.Seq)
+		}
+	})
+
+	for _, mode := range []string{"late-sources", "timeout-late-sources"} {
+		t.Run(mode, func(t *testing.T) {
+			records, stderr := captureConftamerModeResult(t, mode)
+			if strings.Count(stderr, "capture failed:") != 1 || !strings.Contains(stderr, "reply sources declared after final headers") {
+				t.Fatalf("late declaration diagnostics = %q", stderr)
+			}
+			if len(conftamerRecords(records, "send_response", "")) != 1 {
+				t.Fatalf("late declaration records = %+v", records)
+			}
+		})
 	}
 }
 
@@ -274,27 +321,13 @@ func TestConftamerExchangeOwnership(t *testing.T) {
 	}
 }
 
-func TestConftamerContextLifetimes(t *testing.T) {
+func TestConftamerDisabledHelpersAreNoOps(t *testing.T) {
 	ctx := context.WithValue(context.Background(), struct{ name string }{"existing"}, true)
-	if http.ConftamerContext(ctx) != ctx || http.ConftamerContext(nil) != nil {
-		t.Fatal("disabled ConftamerContext changed its argument")
+	request := conftamerMust(t, conftamerResultOf(http.NewRequestWithContext(ctx, http.MethodGet, "http://example.test/", nil)))
+	if annotated := http.ConftamerWithSources(request, request); annotated != request || annotated.Context() != ctx {
+		t.Fatal("disabled request annotation changed request or context identity")
 	}
-
-	records := captureConftamerMode(t, "contexts")
-	if len(records) != 8 {
-		t.Fatalf("record count = %d, want 8", len(records))
-	}
-	requests := conftamerRecords(records, "", "request")
-	wantKinds := []string{"send_request", "receive_request", "send_request", "receive_request"}
-	wantContexts := []uint64{0, 1, 2, 3}
-	if len(requests) != len(wantKinds) {
-		t.Fatalf("request records = %d, want %d", len(requests), len(wantKinds))
-	}
-	for index, record := range requests {
-		if record.Kind != wantKinds[index] || conftamerContextValue(record) != wantContexts[index] {
-			t.Fatalf("request %d = (%s, %d), want (%s, %d)", index, record.Kind, conftamerContextValue(record), wantKinds[index], wantContexts[index])
-		}
-	}
+	http.ConftamerSetReplySources(request, request)
 }
 
 func TestConftamerAttemptLifetimes(t *testing.T) {
@@ -314,21 +347,35 @@ func TestConftamerAttemptLifetimes(t *testing.T) {
 		}
 		outer := conftamerOnlyRecord(t, records, "receive_request", "/nested", 0)
 		inner := conftamerOnlyRecord(t, records, "send_request", "/backend", 0)
-		if len(seen) != 4 || outer.ContextID == nil || conftamerContextValue(outer) != conftamerContextValue(inner) {
-			t.Fatalf("request exchanges/contexts = %v/%v/%v", seen, outer.ContextID, inner.ContextID)
+		if len(seen) != 4 || len(outer.Sources) != 0 || len(inner.Sources) != 0 {
+			t.Fatalf("request exchanges/sources = %v/%v/%v", seen, outer.Sources, inner.Sources)
 		}
 	})
 
 	t.Run("redirect", func(t *testing.T) {
 		records := captureConftamerMode(t, "redirect")
-		attempts := conftamerRecords(records, "send_request", "/redirect/")
-		assertConftamerAttempts(t, records, attempts, 2)
+		sourceSend := conftamerOnlyRecord(t, records, "send_request", "/redirect/source", 0)
+		sourceResponse := conftamerOnlyRecord(t, records, "receive_response", "", sourceSend.ExchangeID)
+		start := conftamerOnlyRecord(t, records, "send_request", "/redirect/start", 0)
+		redirectResponse := conftamerOnlyRecord(t, records, "receive_response", "", start.ExchangeID)
+		final := conftamerOnlyRecord(t, records, "send_request", "/redirect/final", 0)
+		assertConftamerAttempts(t, records, []conftamerCapturedRecord{start, final}, 2)
+		if !slices.Equal(start.Sources, []uint64{sourceResponse.Seq}) || !slices.Equal(final.Sources, []uint64{redirectResponse.Seq}) {
+			t.Fatalf("redirect sources = start %v final %v", start.Sources, final.Sources)
+		}
 	})
 
 	t.Run("retry", func(t *testing.T) {
 		records := captureConftamerMode(t, "retry")
 		attempts := conftamerRecords(records, "send_request", "/retry/2")
 		assertConftamerAttempts(t, records, attempts, 1)
+		sourceSend := conftamerOnlyRecord(t, records, "send_request", "/retry/source", 0)
+		sourceResponse := conftamerOnlyRecord(t, records, "receive_response", "", sourceSend.ExchangeID)
+		for _, attempt := range attempts {
+			if !slices.Equal(attempt.Sources, []uint64{sourceResponse.Seq}) {
+				t.Fatalf("retry attempt sources = %v, want [%d]", attempt.Sources, sourceResponse.Seq)
+			}
+		}
 		if got := len(conftamerRecords(records, "receive_request", "/retry/2")); got != 1 {
 			t.Fatalf("retried server requests = %d, want 1", got)
 		}
@@ -369,15 +416,16 @@ func assertConftamerExchange(t *testing.T, records []conftamerCapturedRecord) {
 	if client.ExchangeID == server.ExchangeID || records[2].ExchangeID != server.ExchangeID || records[3].ExchangeID != client.ExchangeID {
 		t.Fatalf("exchange IDs = %d,%d,%d,%d", client.ExchangeID, server.ExchangeID, records[2].ExchangeID, records[3].ExchangeID)
 	}
-	if client.ContextID == nil || server.ContextID == nil || conftamerContextValue(client) == conftamerContextValue(server) {
-		t.Fatalf("request context IDs = (%v, %v), want distinct known roots", client.ContextID, server.ContextID)
+	if len(client.Sources) != 0 || len(server.Sources) != 0 ||
+		!slices.Equal(records[2].Sources, []uint64{server.Seq}) || len(records[3].Sources) != 0 {
+		t.Fatalf("exchange sources = %v,%v,%v,%v", client.Sources, server.Sources, records[2].Sources, records[3].Sources)
 	}
 }
 
 func assertConftamerAttempts(t *testing.T, records, attempts []conftamerCapturedRecord, wantResponses int) {
 	t.Helper()
-	if len(attempts) != 2 || attempts[0].ExchangeID == attempts[1].ExchangeID || attempts[0].ContextID == nil || conftamerContextValue(attempts[0]) != conftamerContextValue(attempts[1]) {
-		t.Fatalf("attempts = %+v, want two exchanges sharing one known root", attempts)
+	if len(attempts) != 2 || attempts[0].ExchangeID == attempts[1].ExchangeID {
+		t.Fatalf("attempts = %+v, want two distinct exchanges", attempts)
 	}
 	responseExchanges := make(map[uint64]bool)
 	for _, record := range records {
@@ -450,13 +498,6 @@ func conftamerOnlyRecord(t *testing.T, records []conftamerCapturedRecord, kind, 
 	return matches[0]
 }
 
-func conftamerContextValue(record conftamerCapturedRecord) uint64 {
-	if record.ContextID == nil {
-		return 0
-	}
-	return *record.ContextID
-}
-
 func TestConftamerCaptureChild(t *testing.T) {
 	mode := os.Getenv(conftamerCaptureChild)
 	if mode == "" {
@@ -491,14 +532,14 @@ func TestConftamerCaptureChild(t *testing.T) {
 	timeoutRelease := make(chan struct{})
 	timeoutFinished := make(chan struct{})
 	var backendURL string
-	if mode == "nested" {
+	if mode == "nested" || mode == "sources" {
 		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 		defer backend.Close()
 		backendURL = backend.URL
 	}
 	var handler http.Handler
-	if mode == "timeout" {
-		handler = conftamerTimeoutHandler(t, started, timeoutRelease, timeoutFinished)
+	if mode == "timeout" || mode == "timeout-late-sources" {
+		handler = conftamerTimeoutHandler(t, started, timeoutRelease, timeoutFinished, mode == "timeout-late-sources")
 	} else {
 		handler = conftamerTestHandler(t, backendURL, started)
 	}
@@ -517,32 +558,31 @@ func TestConftamerCaptureChild(t *testing.T) {
 		testConftamerRetry(t, server.URL)
 	case "parallel":
 		testConftamerParallelWorkload(t, client, server.URL)
-	case "timeout":
+	case "timeout", "timeout-late-sources":
 		testConftamerTimeoutWorkload(t, client, server.URL, started, timeoutRelease, timeoutFinished)
+	case "sources":
+		conftamerRequest(t, client, server.URL+"/sources", context.Background(), false, http.StatusNoContent, 1)
+	case "informational-sources":
+		conftamerRequest(t, client, server.URL+"/informational-sources", context.Background(), false, http.StatusNoContent, 1)
+	case "late-sources":
+		conftamerRequest(t, client, server.URL+"/late-sources", context.Background(), false, http.StatusNoContent, 1)
 	case "lifecycle":
 		statuses := map[string]int{
 			"/empty": 200, "/explicit": 200, "/informational": 200,
 			"/implicit": 200, "/repeated": 202, "/switch": 101,
 		}
 		for _, path := range []string{"/empty", "/explicit", "/informational", "/implicit", "/repeated", "/switch"} {
-			conftamerRequest(t, client, server.URL+path, http.ConftamerContext(context.Background()), false, statuses[path], 1)
+			conftamerRequest(t, client, server.URL+path, context.Background(), false, statuses[path], 1)
 		}
 		request := conftamerMust(t, conftamerResultOf(http.NewRequestWithContext(
-			http.ConftamerContext(context.Background()), http.MethodGet, server.URL+"/panic", nil,
+			context.Background(), http.MethodGet, server.URL+"/panic", nil,
 		)))
 		if response, err := client.Do(request); err == nil {
 			response.Body.Close()
 			t.Fatal("panic request error = nil")
 		}
-	case "contexts":
-		conftamerRequest(t, client, server.URL+"/unknown", context.Background(), false, http.StatusNoContent, 1)
-		conftamerRequest(t, client, server.URL+"/rooted", http.ConftamerContext(context.Background()), false, http.StatusNoContent, 1)
 	default:
-		root := http.ConftamerContext(context.Background())
-		if http.ConftamerContext(root) != root {
-			t.Fatal("stamping an existing root changed its identity")
-		}
-		ctx := context.WithValue(root, struct{ name string }{"derived"}, true)
+		ctx := context.WithValue(context.Background(), struct{ name string }{"derived"}, true)
 		path, direct := "/resource", mode == "direct"
 		if mode == "nested" {
 			path = "/nested"
@@ -577,6 +617,13 @@ func conftamerTestHandler(t *testing.T, backendURL string, started chan<- struct
 		case "/informational":
 			w.WriteHeader(http.StatusEarlyHints)
 			w.WriteHeader(http.StatusOK)
+		case "/informational-sources":
+			w.WriteHeader(http.StatusEarlyHints)
+			http.ConftamerSetReplySources(request, request)
+			w.WriteHeader(http.StatusNoContent)
+		case "/late-sources":
+			w.WriteHeader(http.StatusNoContent)
+			http.ConftamerSetReplySources(request, request)
 		case "/repeated":
 			w.WriteHeader(http.StatusAccepted)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -614,17 +661,45 @@ func conftamerTestHandler(t *testing.T, backendURL string, started chan<- struct
 			}
 			response.Body.Close()
 			w.WriteHeader(http.StatusNoContent)
+		case "/sources":
+			conftamerSourceWorkload(t, w, request, backendURL)
 		default:
 			w.WriteHeader(http.StatusNoContent)
 		}
 	})
 }
 
-func conftamerTimeoutHandler(t *testing.T, started chan<- struct{}, release <-chan struct{}, finished chan<- struct{}) http.Handler {
-	late := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+func conftamerSourceWorkload(t *testing.T, w http.ResponseWriter, incoming *http.Request, backendURL string) {
+	sourceRequest := conftamerMust(t, conftamerResultOf(http.NewRequest(http.MethodGet, backendURL+"/backend/source", nil)))
+	sourceResponse := conftamerMust(t, conftamerResultOf(http.DefaultClient.Do(sourceRequest)))
+	sourceResponse.Body.Close()
+
+	outbound := conftamerMust(t, conftamerResultOf(http.NewRequestWithContext(incoming.Context(), http.MethodGet, backendURL+"/backend/sink", nil)))
+	originalContext := outbound.Context()
+	declaration := []http.ConftamerSource{sourceResponse, incoming, sourceResponse}
+	annotated := http.ConftamerWithSources(outbound, declaration...)
+	declaration[0] = incoming
+	if annotated == outbound || annotated.Context() != originalContext || outbound.Context() != originalContext {
+		t.Fatal("request annotation changed original request or context")
+	}
+	annotated = annotated.WithContext(annotated.Context())
+	sinkResponse := conftamerMust(t, conftamerResultOf(http.DefaultClient.Do(annotated)))
+	sinkResponse.Body.Close()
+
+	declaration = []http.ConftamerSource{sinkResponse, sourceResponse, incoming, sinkResponse}
+	http.ConftamerSetReplySources(incoming, declaration...)
+	declaration[0] = incoming
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func conftamerTimeoutHandler(t *testing.T, started chan<- struct{}, release <-chan struct{}, finished chan<- struct{}, declareLate bool) http.Handler {
+	late := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		defer close(finished)
 		started <- struct{}{}
 		<-release
+		if declareLate {
+			http.ConftamerSetReplySources(request, request)
+		}
 		if _, err := io.WriteString(w, "late"); !errors.Is(err, http.ErrHandlerTimeout) {
 			t.Errorf("late timeout write error = %v, want ErrHandlerTimeout", err)
 		}
@@ -640,7 +715,7 @@ func testConftamerParallelWorkload(t *testing.T, client *http.Client, serverURL 
 		go func() {
 			defer workers.Done()
 			request, err := http.NewRequestWithContext(
-				http.ConftamerContext(context.Background()),
+				context.Background(),
 				http.MethodGet,
 				fmt.Sprintf("%s/parallel/%d", serverURL, index),
 				nil,
@@ -692,7 +767,7 @@ func testConftamerTimeoutWorkload(t *testing.T, client *http.Client, serverURL s
 		err      error
 	}
 	request := conftamerMust(t, conftamerResultOf(http.NewRequestWithContext(
-		http.ConftamerContext(context.Background()), http.MethodGet, serverURL+"/timeout/7", nil,
+		context.Background(), http.MethodGet, serverURL+"/timeout/7", nil,
 	)))
 	results := make(chan result, 1)
 	go func() {
@@ -729,7 +804,7 @@ func testConftamerTimeoutWorkload(t *testing.T, client *http.Client, serverURL s
 func testConftamerBodyAndTrailers(t *testing.T, client *http.Client, serverURL string) {
 	body := &conftamerCountingBody{reader: strings.NewReader("request body")}
 	request := conftamerMust(t, conftamerResultOf(http.NewRequestWithContext(
-		http.ConftamerContext(context.Background()), http.MethodPost, serverURL+"/behavior/data", body,
+		context.Background(), http.MethodPost, serverURL+"/behavior/data", body,
 	)))
 	response := conftamerMust(t, conftamerResultOf(client.Do(request)))
 	data, readErr := io.ReadAll(response.Body)
@@ -760,23 +835,23 @@ func testConftamerCancellation(t *testing.T, serverURL string, started <-chan st
 		return conftamerMust(t, conftamerResultOf(http.NewRequestWithContext(ctx, http.MethodGet, serverURL+"/behavior/cancel", nil)))
 	}
 
-	ctx, cancel := context.WithCancel(http.ConftamerContext(context.Background()))
+	ctx, cancel := context.WithCancel(context.Background())
 	if err := run(http.DefaultClient, newRequest(ctx), cancel); !errors.Is(err, context.Canceled) {
 		t.Fatalf("context cancellation error = %v", err)
 	}
 	legacy := make(chan struct{})
-	legacyRequest := newRequest(http.ConftamerContext(context.Background()))
+	legacyRequest := newRequest(context.Background())
 	legacyRequest.Cancel = legacy
 	if err := run(http.DefaultClient, legacyRequest, func() { close(legacy) }); err == nil || !strings.Contains(err.Error(), "request canceled") {
 		t.Fatalf("Request.Cancel error = %v", err)
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	defer transport.CloseIdleConnections()
-	transportRequest := newRequest(http.ConftamerContext(context.Background()))
+	transportRequest := newRequest(context.Background())
 	if err := run(&http.Client{Transport: transport}, transportRequest, func() { transport.CancelRequest(transportRequest) }); err == nil || !strings.Contains(err.Error(), "request canceled") {
 		t.Fatalf("CancelRequest error = %v", err)
 	}
-	deadline, stop := context.WithTimeout(http.ConftamerContext(context.Background()), 50*time.Millisecond)
+	deadline, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer stop()
 	response, err := http.DefaultClient.Do(newRequest(deadline))
 	if response != nil {
@@ -788,17 +863,22 @@ func testConftamerCancellation(t *testing.T, serverURL string, started <-chan st
 }
 
 func testConftamerRedirect(t *testing.T, serverURL string) {
+	source := conftamerMust(t, conftamerResultOf(http.Get(serverURL+"/redirect/source")))
+	source.Body.Close()
 	var redirected *http.Request
 	client := &http.Client{CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if len(via) != 1 || next.Response == nil || next.Response.Request != via[0] {
 			return errors.New("unexpected redirect chain")
 		}
+		annotated := http.ConftamerWithSources(next, next.Response)
+		*next = *annotated
 		redirected = next
 		return nil
 	}}
 	request := conftamerMust(t, conftamerResultOf(http.NewRequestWithContext(
-		http.ConftamerContext(context.Background()), http.MethodGet, serverURL+"/redirect/start", nil,
+		context.Background(), http.MethodGet, serverURL+"/redirect/start", nil,
 	)))
+	request = http.ConftamerWithSources(request, source)
 	originalContext := request.Context()
 	response := conftamerMust(t, conftamerResultOf(client.Do(request)))
 	response.Body.Close()
@@ -808,6 +888,8 @@ func testConftamerRedirect(t *testing.T, serverURL string) {
 }
 
 func testConftamerRetry(t *testing.T, serverURL string) {
+	source := conftamerMust(t, conftamerResultOf(http.Get(serverURL+"/retry/source")))
+	source.Body.Close()
 	writeCount := new(atomic.Int32)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -823,7 +905,13 @@ func testConftamerRetry(t *testing.T, serverURL string) {
 	http.SetRoundTripRetried(func() { retried <- struct{}{} })
 	defer http.SetRoundTripRetried(nil)
 	for _, path := range []string{"/retry/1", "/retry/2", "/retry/3"} {
-		conftamerRequest(t, client, serverURL+path, http.ConftamerContext(context.Background()), false, http.StatusNoContent, 1)
+		request := conftamerMust(t, conftamerResultOf(http.NewRequest(http.MethodGet, serverURL+path, nil)))
+		request = http.ConftamerWithSources(request, source)
+		response := conftamerMust(t, conftamerResultOf(client.Do(request)))
+		response.Body.Close()
+		if response.StatusCode != http.StatusNoContent || response.Request != request {
+			t.Fatalf("retry response status/request = %d/%t", response.StatusCode, response.Request == request)
+		}
 	}
 	select {
 	case <-retried:
@@ -856,12 +944,22 @@ func conftamerRequest(t *testing.T, client *http.Client, target string, ctx cont
 
 func captureConftamerMode(t *testing.T, mode string) []conftamerCapturedRecord {
 	t.Helper()
+	records, _ := captureConftamerModeResult(t, mode)
+	return records
+}
+
+func captureConftamerModeResult(t *testing.T, mode string) ([]conftamerCapturedRecord, string) {
+	t.Helper()
 	directory := t.TempDir()
-	runConftamerChild(t, mode, map[string]string{
+	child := newConftamerChildProcess(context.Background(), mode, map[string]string{
 		"CONFTAMER_EVENTS_DIR": directory,
 		"CONFTAMER_CAPTURE_ID": "unit-capture",
-	}, true)
-	return readConftamerRecords(t, directory)
+	})
+	if err := child.command.Run(); err != nil {
+		t.Fatalf("capture child failed: %v\nstdout: %s\nstderr: %s", err, child.stdout.String(), child.stderr.String())
+	}
+	waitConftamerChild(t, child, true)
+	return readConftamerRecords(t, directory), child.stderr.String()
 }
 
 func runConftamerChild(t *testing.T, mode string, settings map[string]string, wantEnabled bool) string {
@@ -894,21 +992,21 @@ func assertConftamerParallelRecords(t *testing.T, records []conftamerCapturedRec
 		t.Fatalf("process %s records = %d, want %d", processID, len(records), conftamerParallelRequests*4)
 	}
 	exchanges := make(map[uint64][]string)
-	contexts := make(map[uint64]bool)
 	for index, record := range records {
-		if record.SchemaVersion != 3 || record.CaptureID != captureID || record.ProcessID != processID || record.Seq != uint64(index+1) {
+		if record.SchemaVersion != 4 || record.CaptureID != captureID || record.ProcessID != processID || record.Seq != uint64(index+1) {
 			t.Fatalf("process %s record %d envelope = %+v", processID, index+1, record)
 		}
 		exchanges[record.ExchangeID] = append(exchanges[record.ExchangeID], record.Kind)
-		if strings.HasSuffix(record.Kind, "request") {
-			if record.ContextID == nil {
-				t.Fatalf("process %s exchange %d has unknown context", processID, record.ExchangeID)
+		if record.Kind == "send_response" {
+			if len(record.Sources) != 1 {
+				t.Fatalf("process %s exchange %d reply sources = %v", processID, record.ExchangeID, record.Sources)
 			}
-			contexts[*record.ContextID] = true
+		} else if len(record.Sources) != 0 {
+			t.Fatalf("process %s exchange %d %s sources = %v", processID, record.ExchangeID, record.Kind, record.Sources)
 		}
 	}
-	if len(exchanges) != conftamerParallelRequests*2 || len(contexts) != conftamerParallelRequests*2 {
-		t.Fatalf("process %s exchange/context counts = %d/%d, want %d/%d", processID, len(exchanges), len(contexts), conftamerParallelRequests*2, conftamerParallelRequests*2)
+	if len(exchanges) != conftamerParallelRequests*2 {
+		t.Fatalf("process %s exchange count = %d, want %d", processID, len(exchanges), conftamerParallelRequests*2)
 	}
 	for id, kinds := range exchanges {
 		sort.Strings(kinds)
@@ -967,7 +1065,7 @@ func TestConftamerConfiguration(t *testing.T) {
 		{name: "missing events directory", env: map[string]string{"CONFTAMER_CAPTURE_ID": "unit"}, want: "must both be set"},
 		{name: "relative directory", env: map[string]string{"CONFTAMER_EVENTS_DIR": "relative", "CONFTAMER_CAPTURE_ID": "unit"}, want: "must be absolute"},
 		{name: "legacy setting", env: map[string]string{"CONFTAMER_EVENTS": "/tmp/legacy"}, want: "CONFTAMER_EVENTS is unsupported"},
-		{name: "legacy wins over v3", env: map[string]string{"CONFTAMER_EVENTS": "/tmp/legacy", "CONFTAMER_EVENTS_DIR": t.TempDir(), "CONFTAMER_CAPTURE_ID": "unit"}, want: "CONFTAMER_EVENTS is unsupported"},
+		{name: "legacy wins over v4", env: map[string]string{"CONFTAMER_EVENTS": "/tmp/legacy", "CONFTAMER_EVENTS_DIR": t.TempDir(), "CONFTAMER_CAPTURE_ID": "unit"}, want: "CONFTAMER_EVENTS is unsupported"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			stderr := runConftamerConfigurationChild(t, test.env)

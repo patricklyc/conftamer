@@ -2,10 +2,12 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +31,7 @@ func conftamerTestResponse(exchangeID uint64) conftamerResponseEvent {
 	event := conftamerResponseEvent{StatusCode: 200}
 	event.Kind = "send_response"
 	event.ExchangeID = exchangeID
+	event.Sources = []uint64{1}
 	return event
 }
 
@@ -37,8 +40,8 @@ func TestConftamerLoggerShortWrite(t *testing.T) {
 	log, diagnostics := conftamerTestLogger(output)
 	event := conftamerTestResponse(1)
 	for range 2 {
-		if err := log.write(&event.conftamerEnvelope, &event); !errors.Is(err, io.ErrShortWrite) {
-			t.Fatalf("write error = %v, want io.ErrShortWrite", err)
+		if seq, err := log.write(&event.conftamerEnvelope, &event); seq != 0 || !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("write sequence/error = %d/%v, want 0/io.ErrShortWrite", seq, err)
 		}
 	}
 	if output.calls != 1 || strings.Count(diagnostics.String(), "conftamer: capture failed:") != 1 {
@@ -59,7 +62,11 @@ func TestConftamerLoggerConcurrentSequence(t *testing.T) {
 			defer workers.Done()
 			<-start
 			event := conftamerTestResponse(exchangeID)
-			errorsSeen <- log.write(&event.conftamerEnvelope, &event)
+			seq, err := log.write(&event.conftamerEnvelope, &event)
+			if err == nil && seq == 0 {
+				err = errors.New("successful write returned no sequence")
+			}
+			errorsSeen <- err
 		}()
 	}
 	close(start)
@@ -82,7 +89,7 @@ func TestConftamerLoggerConcurrentSequence(t *testing.T) {
 		if err := json.Unmarshal(line, &event); err != nil {
 			t.Fatalf("line %d: %v", index+1, err)
 		}
-		if event.SchemaVersion != 3 || event.CaptureID != "unit" || event.ProcessID != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || event.Seq != uint64(index+1) {
+		if event.SchemaVersion != 4 || event.CaptureID != "unit" || event.ProcessID != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || event.Seq != uint64(index+1) {
 			t.Fatalf("line %d envelope = %+v", index+1, event.conftamerEnvelope)
 		}
 	}
@@ -97,9 +104,10 @@ func TestConftamerLoggerRejectsInvalidRecords(t *testing.T) {
 			Unsupported chan int `json:"unsupported"`
 		}{Unsupported: make(chan int)}
 		record.Kind, record.ExchangeID = "send_response", 1
-		firstErr := log.write(&record.conftamerEnvelope, &record)
-		if firstErr == nil || log.write(&record.conftamerEnvelope, &record) != firstErr || output.Len() != 0 {
-			t.Fatalf("marshal/latched error or output = %v/%q", firstErr, output.String())
+		firstSeq, firstErr := log.write(&record.conftamerEnvelope, &record)
+		secondSeq, secondErr := log.write(&record.conftamerEnvelope, &record)
+		if firstSeq != 0 || firstErr == nil || secondSeq != 0 || secondErr != firstErr || output.Len() != 0 {
+			t.Fatalf("marshal sequences/latched error or output = %d/%v/%d/%v/%q", firstSeq, firstErr, secondSeq, secondErr, output.String())
 		}
 	})
 
@@ -110,30 +118,120 @@ func TestConftamerLoggerRejectsInvalidRecords(t *testing.T) {
 			Method: string([]byte{0xff}), Host: stringPointer("example.test"), Path: "/",
 		}}
 		event.Kind, event.ExchangeID = "send_request", 1
-		if err := log.write(&event.conftamerEnvelope, &event); !errors.Is(err, errConftamerInvalidUTF8) || output.Len() != 0 {
-			t.Fatalf("write error/output = %v/%q", err, output.String())
+		if seq, err := log.write(&event.conftamerEnvelope, &event); seq != 0 || !errors.Is(err, errConftamerInvalidUTF8) || output.Len() != 0 {
+			t.Fatalf("write sequence/error/output = %d/%v/%q", seq, err, output.String())
 		}
 	})
 }
 
-func TestConftamerV3RequestShape(t *testing.T) {
+func TestConftamerV4RequestShape(t *testing.T) {
 	var output bytes.Buffer
 	log, _ := conftamerTestLogger(&output)
 	event := conftamerRequestEvent{Request: conftamerRequestLabel{
 		Method: "GET", Host: stringPointer("example.test"), Path: "/",
 	}}
 	event.Kind, event.ExchangeID = "send_request", 1
-	if err := log.write(&event.conftamerEnvelope, &event); err != nil {
-		t.Fatal(err)
+	event.Sources = []uint64{}
+	if seq, err := log.write(&event.conftamerEnvelope, &event); seq != 1 || err != nil {
+		t.Fatalf("write sequence/error = %d/%v", seq, err)
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(output.Bytes(), &fields); err != nil {
 		t.Fatal(err)
 	}
 	assertConftamerJSONFields(t, fields, "schema_version", "capture_id",
-		"process_id", "seq", "exchange_id", "kind", "context_id", "request")
-	if string(fields["schema_version"]) != "3" || string(fields["context_id"]) != "null" {
+		"process_id", "seq", "exchange_id", "kind", "sources", "request")
+	if string(fields["schema_version"]) != "4" || string(fields["sources"]) != "[]" {
 		t.Fatalf("unexpected envelope: %s", output.String())
+	}
+	if _, exists := fields["context_id"]; exists {
+		t.Fatalf("v4 request retained context_id: %s", output.String())
+	}
+}
+
+func TestConftamerSourceHelpersCopyAndCanonicalize(t *testing.T) {
+	_, log := conftamerInstallTestLogger(t)
+	ctx := context.WithValue(context.Background(), struct{ name string }{"existing"}, true)
+	original := &Request{ctx: ctx}
+	requestSource := &Request{conftamerReceiveSequence: 3}
+	responseSource := &Response{conftamerReceiveSequence: 1}
+	supplied := []ConftamerSource{requestSource, responseSource, requestSource}
+
+	annotated := ConftamerWithSources(original, supplied...)
+	supplied[0] = responseSource
+	copied := annotated.WithContext(ctx)
+	replaced := ConftamerWithSources(copied, responseSource)
+	if annotated == original || annotated.Context() != ctx || original.conftamerSources != nil {
+		t.Fatalf("annotation changed original or context: annotated=%p original=%p", annotated, original)
+	}
+	if got := annotated.conftamerSources; !slices.Equal(got, []uint64{1, 3}) {
+		t.Fatalf("annotated sources = %v, want [1 3]", got)
+	}
+	if got := copied.conftamerSources; !slices.Equal(got, []uint64{1, 3}) {
+		t.Fatalf("copied sources = %v, want [1 3]", got)
+	}
+	if got := replaced.conftamerSources; !slices.Equal(got, []uint64{1}) || !slices.Equal(annotated.conftamerSources, []uint64{1, 3}) {
+		t.Fatalf("replacement contaminated sources: replaced=%v annotated=%v", got, annotated.conftamerSources)
+	}
+
+	log.stopped.Store(true)
+	if got := ConftamerWithSources(original, requestSource); got != original {
+		t.Fatal("stopped capture changed request identity")
+	}
+	ConftamerSetReplySources(original, requestSource)
+}
+
+func TestConftamerSourceHelpersRejectInvalidAndLateDeclarations(t *testing.T) {
+	t.Run("invalid source", func(t *testing.T) {
+		_, log := conftamerInstallTestLogger(t)
+		request := new(Request)
+		if got := ConftamerWithSources(request, new(Response)); got != request || !log.stopped.Load() {
+			t.Fatalf("request identity/stopped = %t/%t, want true/true", got == request, log.stopped.Load())
+		}
+	})
+
+	t.Run("invalid reply target", func(t *testing.T) {
+		_, log := conftamerInstallTestLogger(t)
+		ConftamerSetReplySources(new(Request))
+		if !log.stopped.Load() {
+			t.Fatal("invalid reply target did not stop capture")
+		}
+	})
+
+	t.Run("late reply", func(t *testing.T) {
+		_, log := conftamerInstallTestLogger(t)
+		slot := new(conftamerReplySources)
+		target := &Request{
+			conftamerExchange:        &conftamerExchange{id: 1},
+			conftamerReceiveSequence: 2,
+			conftamerReply:           slot,
+		}
+		source := &Response{conftamerReceiveSequence: 1}
+		ConftamerSetReplySources(target, source)
+		if got := slot.freeze(2); !slices.Equal(got, []uint64{1, 2}) {
+			t.Fatalf("frozen reply sources = %v, want [1 2]", got)
+		}
+		ConftamerSetReplySources(target, target)
+		if !log.stopped.Load() || !slices.Equal(slot.sources, []uint64{1}) {
+			t.Fatalf("late declaration stopped/sources = %t/%v", log.stopped.Load(), slot.sources)
+		}
+	})
+}
+
+func TestConftamerServerAttachmentPreservesContext(t *testing.T) {
+	output, _ := conftamerInstallTestLogger(t)
+	ctx := context.WithValue(context.Background(), struct{ name string }{"existing"}, true)
+	request := &Request{Method: "GET", ProtoMajor: 1, URL: &url.URL{Path: "/"}, ctx: ctx}
+	conftamerAttachServerRequest(request)
+	if request.Context() != ctx || request.conftamerExchange == nil || request.conftamerReceiveSequence != 1 || request.conftamerReply == nil {
+		t.Fatalf("context/exchange/sequence/reply = %t/%v/%d/%v", request.Context() == ctx, request.conftamerExchange, request.conftamerReceiveSequence, request.conftamerReply)
+	}
+	var event conftamerRequestEvent
+	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Kind != "receive_request" || event.Seq != request.conftamerReceiveSequence || len(event.Sources) != 0 {
+		t.Fatalf("server request event = %+v", event)
 	}
 }
 

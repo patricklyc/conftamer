@@ -43,41 +43,41 @@ func newConftamerLogger(w io.Writer, captureID, processID string) *conftamerLogg
 
 // write assigns the process-local sequence and writes one complete JSON line.
 // The first encoding or I/O failure permanently stops this logger.
-func (log *conftamerLogger) write(header *conftamerEnvelope, record any) error {
+func (log *conftamerLogger) write(header *conftamerEnvelope, record any) (uint64, error) {
 	log.mu.Lock()
 	defer log.mu.Unlock()
 
 	if log.firstErr != nil {
-		return log.firstErr
+		return 0, log.firstErr
 	}
 	if header == nil {
-		return log.failLocked(errors.New("conftamer record has a nil envelope"))
+		return 0, log.failLocked(errors.New("conftamer record has a nil envelope"))
 	}
 	if log.seq == ^uint64(0) {
-		return log.failLocked(errors.New("conftamer sequence exhausted"))
+		return 0, log.failLocked(errors.New("conftamer sequence exhausted"))
 	}
 
-	header.SchemaVersion = 3
+	header.SchemaVersion = 4
 	header.CaptureID = log.captureID
 	header.ProcessID = log.processID
 	header.Seq = log.seq + 1
 	if err := conftamerValidateStrings(header, record); err != nil {
-		return log.failLocked(err)
+		return 0, log.failLocked(err)
 	}
 	line, err := json.Marshal(record)
 	if err != nil {
-		return log.failLocked(fmt.Errorf("marshal conftamer record: %w", err))
+		return 0, log.failLocked(fmt.Errorf("marshal conftamer record: %w", err))
 	}
 	line = append(line, '\n')
 	written, err := log.writer.Write(line)
 	if err != nil {
-		return log.failLocked(fmt.Errorf("write conftamer record: %w", err))
+		return 0, log.failLocked(fmt.Errorf("write conftamer record: %w", err))
 	}
 	if written != len(line) {
-		return log.failLocked(io.ErrShortWrite)
+		return 0, log.failLocked(io.ErrShortWrite)
 	}
 	log.seq = header.Seq
-	return nil
+	return header.Seq, nil
 }
 
 func (log *conftamerLogger) failLocked(err error) error {
@@ -93,12 +93,16 @@ func (log *conftamerLogger) failLocked(err error) error {
 
 // conftamerWriteRecord provides the lock-free disabled/stopped fast path used
 // by protocol hooks. Capture errors are diagnostics and never alter HTTP results.
-func conftamerWriteRecord(header *conftamerEnvelope, record any) {
+func conftamerWriteRecord(header *conftamerEnvelope, record any) uint64 {
 	log := conftamerActiveLogger.Load()
 	if log == nil || log.stopped.Load() {
-		return
+		return 0
 	}
-	_ = log.write(header, record)
+	sequence, err := log.write(header, record)
+	if err != nil {
+		return 0
+	}
+	return sequence
 }
 
 func conftamerFailCapture(err error) {
