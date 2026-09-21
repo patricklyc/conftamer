@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from contexttrack.events import EVENT_ADAPTER, MessageLabel
 
 ROOT = Path(__file__).parents[1]
-FIXTURE = ROOT / "testdata/v3-chain.jsonl"
+FIXTURE = ROOT / "testdata/v4-chain.jsonl"
 SCHEMA = ROOT / "event.schema.json"
 
 
@@ -37,27 +37,49 @@ def test_fixture_has_four_kinds_and_two_exact_shapes():
         "seq",
         "exchange_id",
         "kind",
+        "sources",
     }
-    assert set(records[0]) == envelope | {"context_id", "request"}
+    assert set(records[0]) == envelope | {"request"}
     assert set(records[2]) == envelope | {"status_code"}
 
 
-@pytest.mark.parametrize("version", [1, 2, "3", 3.0, True])
-def test_schema_version_is_exact_integer_three(version):
+@pytest.mark.parametrize("version", [1, 2, 3, "4", 4.0, True])
+def test_schema_version_is_exact_integer_four(version):
     record = fixture_record(0)
     record["schema_version"] = version
 
     assert_invalid(record)
 
 
-@pytest.mark.parametrize(
-    ("record_index", "field"),
-    [(0, "seq"), (0, "exchange_id"), (0, "context_id")],
-)
+@pytest.mark.parametrize("field", ["seq", "exchange_id"])
 @pytest.mark.parametrize("value", [True, "1", 0, 2**64])
-def test_counters_are_strict_unsigned_nonzero(record_index, field, value):
-    record = fixture_record(record_index)
+def test_counters_are_strict_unsigned_nonzero(field, value):
+    record = fixture_record(0)
     record[field] = value
+
+    assert_invalid(record)
+
+
+@pytest.mark.parametrize("value", [True, "1", 0, 2**64])
+def test_source_counters_are_strict_unsigned_nonzero(value):
+    record = fixture_record(1)
+    record["sources"] = [value]
+
+    assert_invalid(record)
+
+
+@pytest.mark.parametrize("sources", [[1, 1], [3, 1]])
+def test_sources_must_be_sorted_and_unique(sources):
+    record = fixture_record(3)
+    record["sources"] = sources
+
+    assert_invalid(record)
+
+
+@pytest.mark.parametrize("index", [0, 2])
+def test_receive_records_require_empty_sources(index):
+    record = fixture_record(index)
+    record["sources"] = [1]
 
     assert_invalid(record)
 
@@ -92,7 +114,8 @@ def test_other_event_kinds_are_rejected(kind):
         (0, "api_id", None),
         (0, "route", None),
         (0, "status_code", 200),
-        (2, "context_id", 7),
+        (0, "context_id", 7),
+        (2, "context_id", None),
         (2, "request", {}),
     ],
 )
@@ -112,8 +135,11 @@ def test_unknown_nested_request_fields_are_rejected():
     assert_invalid(record)
 
 
-@pytest.mark.parametrize(("index", "path"), [(0, ("context_id",)), (0, ("request", "host"))])
-def test_nullable_fields_are_required(index, path):
+@pytest.mark.parametrize(
+    ("index", "path"),
+    [(0, ("sources",)), (0, ("request", "host"))],
+)
+def test_required_fields_cannot_be_omitted(index, path):
     record = fixture_record(index)
     target = record
     for component in path[:-1]:
@@ -134,33 +160,33 @@ def test_send_request_requires_host():
     assert_invalid(record)
 
 
-def test_empty_path_null_context_and_unicode_are_preserved():
+def test_empty_path_and_unicode_are_preserved():
     record = fixture_record(1)
     request = record["request"]
     assert isinstance(request, dict)
     request.update(method="MÉTHODE", host="módulo.example", path="")
-    record["context_id"] = None
 
     event = EVENT_ADAPTER.validate_json(json.dumps(record))
 
     assert event.request.method == "MÉTHODE"
     assert event.request.host == "módulo.example"
     assert event.request.path == ""
-    assert event.context_id is None
+    assert event.sources == [1]
 
 
-def test_v1_v2_and_former_metadata_records_are_rejected():
-    for version in (1, 2):
+def test_v1_v2_v3_and_former_metadata_records_are_rejected():
+    for version in (1, 2, 3):
         record = fixture_record(0)
         record["schema_version"] = version
         assert_invalid(record)
     metadata: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "capture_id": "capture",
         "process_id": "a" * 32,
         "seq": 1,
         "exchange_id": 1,
         "kind": "request_metadata",
+        "sources": [],
         "route": None,
         "api_id": "example.org/api",
     }
@@ -227,7 +253,10 @@ def test_server_label_requires_null_host_and_concrete_path():
 
 @pytest.mark.parametrize("kind", ["send_request", "receive_request"])
 def test_request_labels_forbid_status(kind):
-    fields = message_label(kind=kind, host=None if kind == "receive_request" else "service.test").model_dump()
+    fields = message_label(
+        kind=kind,
+        host=None if kind == "receive_request" else "service.test",
+    ).model_dump()
     fields["status_code"] = 200
 
     with pytest.raises(ValidationError):

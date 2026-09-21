@@ -1,13 +1,20 @@
-# ContextTrack v3 output contract
+# ContextTrack v4 output contract
 
-This is the sole human-readable contract for the version 3 producer, reader,
-semantic labels, and possible-influence relation. The strict executable models
-are in `src/contexttrack/events.py`. Version 1 and version 2 inputs are rejected;
-no compatibility aliases, discarded legacy fields, or converter are provided.
+This is the sole human-readable contract for version 4 records, the strict
+Python reader, semantic labels, and recorded influence relation. The executable
+record models are in `src/contexttrack/events.py`. Version 1, version 2, and
+version 3 inputs are rejected; no compatibility aliases, discarded legacy
+fields, or converter are provided.
+
+This Task 1 checkout is an intentional intermediate state: the Python package
+reads v4 only, while the patched Go producer still emits v3 until Task 2 of
+`docs/contexttrack-v4-plan.md`. It is not a releasable producer/reader pair and
+must not be used to claim v4 producer evidence.
 
 ## Capture and failure behavior
 
-Capture is enabled only when both settings exist before process startup:
+The v4 producer retains the checked v3 logger behavior. Capture is enabled only
+when both settings exist before process startup:
 
 ```text
 CONFTAMER_EVENTS_DIR=/absolute/path/to/an/existing-directory
@@ -42,22 +49,29 @@ Every record has exactly this envelope plus its variant fields:
 
 | Field | Contract |
 | --- | --- |
-| `schema_version` | strict integer `3` |
+| `schema_version` | strict integer `4` |
 | `capture_id` | nonempty string |
 | `process_id` | 32 lowercase hexadecimal characters |
 | `seq` | strict integer in `1..2^64-1` |
 | `exchange_id` | strict integer in `1..2^64-1` |
 | `kind` | one of the four message kinds |
+| `sources` | required array of scoped source-receive sequence numbers |
 
-Booleans, floats, and strings are not integers. Required nullable fields must be
-present as JSON `null`; fields from another variant must be absent.
+Booleans, floats, and strings are not integers. `sources` entries are strict
+integers in `1..2^64-1`, sorted, and unique. Every source must precede its
+target and identify a received message in the same capture process. Receives
+have `sources: []`. Unknown fields and fields from another variant must be
+absent. The v3 `context_id` field is removed.
+
+A source number is shorthand for
+`(target.capture_id, target.process_id, source_seq)`. It is not resolved across
+process files or captures.
 
 ## Request records
 
 Kinds: `send_request` and `receive_request`.
 
 ```text
-context_id: strict integer in 1..2^64-1, or null
 request: {method: nonempty string, host: nonempty string or null, path: string}
 ```
 
@@ -66,23 +80,28 @@ effective authority exists. The producer snapshots the method, effective HTTP
 authority, and raw `URL.Path`; an explicit empty path is valid. Authority
 spelling and ports are preserved.
 
-A request declares one exchange. Server ingress creates a fresh context root on
-the server-owned request. Client attempts read an inherited root or record null;
-they do not mutate caller-owned requests or create implicit roots.
+A request declares one exchange. A sent request may have an empty source list;
+this means its influence is unknown or undeclared, not that it is independent.
 
 ## Response records
 
-Kinds: `send_response` and `receive_response`. The sole variant field is:
+Kinds: `send_response` and `receive_response`. The response variant adds:
 
 ```text
 status_code: strict integer 101 or 200..999
 ```
 
-A response refers to its exact request through scoped exchange identity and does
-not repeat context or request fields. `receive_response` must reference a
-preceding `send_request`; `send_response` must reference a preceding
-`receive_request`. At most one final response is allowed per exchange. A request
-without a response remains valid.
+A response refers to its exact request through scoped exchange identity and
+does not repeat request fields. `receive_response` must reference a preceding
+`send_request`; `send_response` must reference a preceding `receive_request`.
+At most one final response is allowed per exchange. A request without a
+response remains valid.
+
+A received response has `sources: []`. A sent server response must include its
+own request receive sequence; this is the automatic exact request/reply
+relationship. It may include other declared receive sources. Dependencies that
+affect only body output after final headers have been recorded are outside this
+contract; source declarations are not retroactive.
 
 Ordinary informational responses, bodies, trailers, cancellation, send errors,
 and completion have no record kind. An observation is not proof of peer
@@ -90,23 +109,23 @@ delivery.
 
 ## Identities and exact association
 
-The three identities have separate purposes:
+The two scoped identities have separate purposes:
 
 | Identity | Meaning |
 | --- | --- |
-| `(capture_id, process_id, seq)` | one record and diagnostic location |
+| `(capture_id, process_id, seq)` | one record, source reference, and diagnostic location |
 | `(capture_id, process_id, exchange_id)` | one server request or client attempt |
-| `(capture_id, process_id, context_id)` | one known inherited context root |
 
 Counters may repeat across processes and captures. They are not semantic graph
 nodes, transmitted trace headers, operating-system PIDs, goroutine IDs, heap
 addresses, or stable cross-run identifiers. Client and server IDs are not
 forced to match for network correlation.
 
-The reader keeps one exchange table. Each request occurrence is resolved and
-appended immediately; a response copies the exact origin's context and request
-label fields and adds response kind and status. There is no URL, FIFO, context,
-chronology, stack, or nearest-record search for an origin.
+The reader keeps exact record and exchange tables. Each request occurrence is
+resolved and appended immediately; a response copies the exact exchange
+origin's request-label fields and adds response kind and status. Each source is
+resolved only against preceding receive occurrences in its process. There is no
+URL, FIFO, context, chronology, stack, transitive, or nearest-record search.
 
 ## Semantic labels and occurrences
 
@@ -122,18 +141,27 @@ kind, method, host, path, status_code
 - Request labels have a null status; response labels have a terminal status.
 - An explicitly empty raw path becomes `/`; no other normalization occurs.
 
-Labels contain no capture, process, exchange, context, sequence, line, module,
+Labels contain no capture, process, exchange, source, sequence, line, module,
 API, or route identity. Equal labels can therefore deduplicate while their
 runtime occurrences remain distinct.
 
 The retained immutable library values are:
 
 ```text
-Occurrence(label, context_key, exchange_key, seq, location)
+RecordKey = (capture_id, process_id, seq)
+ExchangeKey = (capture_id, process_id, exchange_id)
+Occurrence(label, record_key, exchange_key, source_keys, location)
 Capture(occurrences: tuple[Occurrence, ...])
 read_capture(path: str | Path) -> Capture
-shared_context_pairs(occurrences) -> set[(MessageLabel, MessageLabel)]
+influence_edges(capture)
+    -> dict[(MessageLabel, MessageLabel), (Occurrence, Occurrence)]
 ```
+
+`source_keys` and `occurrences` are tuples. `read_capture` preserves every
+occurrence and every resolved source reference. `influence_edges` associates
+occurrences first, then maps each semantic label pair to one deterministic exact
+source/target witness for display. Equal label pairs can share one displayed
+edge without erasing the retained occurrences.
 
 ## Reader integrity
 
@@ -151,36 +179,50 @@ For nonempty input it enforces:
 3. one file per process identity;
 4. sequences contiguous from 1;
 5. unique request declarations;
-6. preceding response origins and correct response direction; and
-7. at most one final response per exchange.
+6. preceding response origins and correct response direction;
+7. at most one final response per exchange;
+8. sorted, unique source counters resolving to preceding receives in the same
+   process; and
+9. inclusion of the exact incoming request in every server reply's sources.
 
-Empty files and directories, requests without responses, null contexts, and
-reused counters in different processes are valid. Passing validation proves
-internal consistency of consumed records, not capture completeness, workload
-purity, or exercised coverage.
+Empty files and directories, requests without responses, empty send source
+lists, and reused counters in different processes are valid. Passing validation
+proves internal consistency of consumed records, not capture completeness,
+workload purity, correct annotation placement, or exercised coverage.
 
-## Possible influence
+## Recorded influence
 
-For every known scoped context `c`, collect received and sent semantic labels:
+An edge exists only when a send record names a particular preceding receive in
+its `sources` array. The edge is from that exact receive occurrence to that
+exact send occurrence. The incoming request to its own server response is the
+one automatic source; other data or control influences require declarations at
+the outgoing operation.
 
-```text
-R(c) = {receive_request, receive_response}
-S(c) = {send_request, send_response}
-E = union over c of R(c) x S(c)
-```
+No edge is created from shared context, logging order, URL equality, exchange
+proximity, or inferred transitivity. Receiving a response does not inherit the
+sources of the corresponding request. An empty source list means influence is
+unknown or undeclared, never proven independence.
 
-The relation is order-independent. It has no chronology filter, URL matching,
-or same-exchange exclusion. A received response may therefore point to the
-earlier request send in its context. This overapproximates possible influence;
-it is not temporal causality.
+`testdata/v4-chain.jsonl` contains:
 
-Null contexts never group. Occurrences are retained through association, then
-final labels and edges are deduplicated. Isolated labels remain visible.
+| Sequence | Message | Sources |
+| ---: | --- | --- |
+| 1 | received incoming request A | `[]` |
+| 2 | sent downstream request B | `[1]` |
+| 3 | received downstream response C | `[]` |
+| 4 | sent server reply D | `[1, 3]` |
 
-`testdata/v3-chain.jsonl` contains four message occurrences in one known
-context: a received server request, a sent downstream request, its received
-response, and the server's sent response. Both receives pair with both sends,
-producing exactly four edges. The unchanged v2 fixture must be rejected.
+It produces exactly **A -> B**, **A -> D**, and **C -> D**. The first is a
+declared edge, the second is the automatic request/reply edge, and the third is
+a declared edge. The unchanged v2 and v3 fixtures are rejection fixtures.
+
+## Diagnostic output
+
+`contexttrack INPUT` renders one node per distinct semantic label and one edge
+per distinct label pair. Every edge includes a representative source and target
+record location and is marked `request/reply` or `declared`. Isolated labels
+remain visible. The summary reports `sends_without_sources`; it does not call
+those sends independent.
 
 ## Schema and coverage limits
 
@@ -188,7 +230,9 @@ producing exactly four edges. The unchanged v2 fixture must be rejected.
 does not express every Pydantic after-validator or any cross-record integrity
 rule. Python consumers should use `EVENT_ADAPTER` and `read_capture`.
 
-The producer observes selected standard-library HTTP/1 transitions only.
-External HTTP/2, custom transports, mocks, pre-dispatch failures, tunnels, and
-bodies may bypass it. API ownership and route patterns were deliberately
-removed. A clean diagnostic and valid records still do not prove completeness.
+The graph remains limited to selected standard-library HTTP/1 observation
+boundaries. External HTTP/2, custom transports, mocks, pre-dispatch failures,
+tunnels, and bodies may bypass it. API ownership and route patterns are absent.
+A clean diagnostic and valid records still do not prove completeness. Declared
+sources are reviewed application assertions; structural validation cannot prove
+that application code actually used an input.

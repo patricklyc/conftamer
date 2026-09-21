@@ -1,3 +1,4 @@
+from itertools import pairwise
 from typing import Annotated, Literal, Self
 
 from pydantic import (
@@ -25,11 +26,12 @@ class RequestLabel(Model):
 
 
 class Envelope(Model):
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     capture_id: Text
     process_id: ProcessID
     seq: Counter
     exchange_id: Counter
+    sources: list[Counter]
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -38,16 +40,24 @@ class Envelope(Model):
             raise ValueError("schema_version must be an integer")
         return value
 
+    @field_validator("sources")
+    @classmethod
+    def canonical_sources(cls, value: list[int]) -> list[int]:
+        if any(left >= right for left, right in pairwise(value)):
+            raise ValueError("sources must be sorted and unique")
+        return value
+
 
 class RequestEvent(Envelope):
     kind: Literal["send_request", "receive_request"]
-    context_id: Counter | None
     request: RequestLabel
 
     @model_validator(mode="after")
-    def client_host(self) -> Self:
+    def request_shape(self) -> Self:
         if self.kind == "send_request" and self.request.host is None:
             raise ValueError("send_request requires a host")
+        if self.kind == "receive_request" and self.sources:
+            raise ValueError("receive_request requires empty sources")
         return self
 
 
@@ -56,9 +66,11 @@ class ResponseEvent(Envelope):
     status_code: Annotated[int, Field(strict=True, ge=100, le=999)]
 
     @model_validator(mode="after")
-    def terminal_status(self) -> Self:
+    def response_shape(self) -> Self:
         if self.status_code < 200 and self.status_code != 101:
             raise ValueError("only terminal responses are recorded")
+        if self.kind == "receive_response" and self.sources:
+            raise ValueError("receive_response requires empty sources")
         return self
 
 

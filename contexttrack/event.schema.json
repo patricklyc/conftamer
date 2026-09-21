@@ -4,7 +4,7 @@
       "additionalProperties": false,
       "properties": {
         "schema_version": {
-          "const": 3,
+          "const": 4,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -30,6 +30,15 @@
           "title": "Exchange Id",
           "type": "integer"
         },
+        "sources": {
+          "items": {
+            "maximum": 18446744073709551615,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
         "kind": {
           "enum": [
             "send_request",
@@ -37,19 +46,6 @@
           ],
           "title": "Kind",
           "type": "string"
-        },
-        "context_id": {
-          "anyOf": [
-            {
-              "maximum": 18446744073709551615,
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Context Id"
         },
         "request": {
           "$ref": "#/$defs/RequestLabel"
@@ -61,8 +57,8 @@
         "process_id",
         "seq",
         "exchange_id",
+        "sources",
         "kind",
-        "context_id",
         "request"
       ],
       "title": "RequestEvent",
@@ -105,7 +101,7 @@
       "additionalProperties": false,
       "properties": {
         "schema_version": {
-          "const": 3,
+          "const": 4,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -131,6 +127,15 @@
           "title": "Exchange Id",
           "type": "integer"
         },
+        "sources": {
+          "items": {
+            "maximum": 18446744073709551615,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
         "kind": {
           "enum": [
             "send_response",
@@ -152,6 +157,7 @@
         "process_id",
         "seq",
         "exchange_id",
+        "sources",
         "kind",
         "status_code"
       ],

@@ -1,4 +1,3 @@
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,15 +11,16 @@ from contexttrack.events import (
     ResponseEvent,
 )
 
-CaptureKey = tuple[str, str, int]
+RecordKey = tuple[str, str, int]
+ExchangeKey = tuple[str, str, int]
 
 
 @dataclass(frozen=True)
 class Occurrence:
     label: MessageLabel
-    context_key: CaptureKey | None
-    exchange_key: CaptureKey
-    seq: int
+    record_key: RecordKey
+    exchange_key: ExchangeKey
+    source_keys: tuple[RecordKey, ...]
     location: str
 
 
@@ -35,11 +35,19 @@ class _Exchange:
     response_location: str | None = None
 
 
-def _key(event: Event) -> CaptureKey:
+def _record_key(event: Event) -> RecordKey:
+    return (event.capture_id, event.process_id, event.seq)
+
+
+def _exchange_key(event: Event) -> ExchangeKey:
     return (event.capture_id, event.process_id, event.exchange_id)
 
 
-def _request_occurrence(event: RequestEvent, location: str) -> Occurrence:
+def _request_occurrence(
+    event: RequestEvent,
+    source_keys: tuple[RecordKey, ...],
+    location: str,
+) -> Occurrence:
     path = "/" if event.request.path == "" else event.request.path
     label = MessageLabel(
         kind=event.kind,
@@ -48,17 +56,19 @@ def _request_occurrence(event: RequestEvent, location: str) -> Occurrence:
         path=path,
         status_code=None,
     )
-    context_key = (
-        None
-        if event.context_id is None
-        else (event.capture_id, event.process_id, event.context_id)
+    return Occurrence(
+        label,
+        _record_key(event),
+        _exchange_key(event),
+        source_keys,
+        location,
     )
-    return Occurrence(label, context_key, _key(event), event.seq, location)
 
 
 def _response_occurrence(
     event: ResponseEvent,
     exchange: _Exchange,
+    source_keys: tuple[RecordKey, ...],
     location: str,
 ) -> Occurrence:
     label = exchange.origin.label.model_copy(
@@ -66,11 +76,39 @@ def _response_occurrence(
     )
     return Occurrence(
         label,
-        exchange.origin.context_key,
-        _key(event),
-        event.seq,
+        _record_key(event),
+        _exchange_key(event),
+        source_keys,
         location,
     )
+
+
+def _resolve_sources(
+    event: Event,
+    records: dict[RecordKey, Occurrence],
+    location: str,
+) -> tuple[RecordKey, ...]:
+    source_keys: list[RecordKey] = []
+    for source_seq in event.sources:
+        if source_seq >= event.seq:
+            raise ValueError(
+                f"{location}: source sequence {source_seq} must precede "
+                f"target sequence {event.seq}"
+            )
+        source_key = (event.capture_id, event.process_id, source_seq)
+        source = records.get(source_key)
+        if source is None:
+            raise ValueError(
+                f"{location}: source sequence {source_seq} does not identify "
+                "a preceding record in this process"
+            )
+        if source.label.kind not in ("receive_request", "receive_response"):
+            raise ValueError(
+                f"{location}: source sequence {source_seq} identifies "
+                f"{source.label.kind} at {source.location}, not a receive"
+            )
+        source_keys.append(source_key)
+    return tuple(source_keys)
 
 
 def read_capture(path: str | Path) -> Capture:
@@ -81,7 +119,8 @@ def read_capture(path: str | Path) -> Capture:
         else [capture_path]
     )
     occurrences: list[Occurrence] = []
-    exchanges: dict[CaptureKey, _Exchange] = {}
+    records: dict[RecordKey, Occurrence] = {}
+    exchanges: dict[ExchangeKey, _Exchange] = {}
     capture_identity: tuple[str, str] | None = None
     process_files: dict[str, str] = {}
 
@@ -141,18 +180,19 @@ def read_capture(path: str | Path) -> Capture:
                         f"{location}: sequence expected {expected_seq}, got {event.seq}"
                     )
 
-                key = _key(event)
+                source_keys = _resolve_sources(event, records, location)
+                exchange_key = _exchange_key(event)
                 if isinstance(event, RequestEvent):
-                    previous = exchanges.get(key)
+                    previous = exchanges.get(exchange_key)
                     if previous is not None:
                         raise ValueError(
                             f"{location}: exchange {event.exchange_id} was already "
                             f"declared at {previous.origin.location}"
                         )
-                    occurrence = _request_occurrence(event, location)
-                    exchanges[key] = _Exchange(occurrence)
+                    occurrence = _request_occurrence(event, source_keys, location)
+                    exchanges[exchange_key] = _Exchange(occurrence)
                 else:
-                    exchange = exchanges.get(key)
+                    exchange = exchanges.get(exchange_key)
                     if exchange is None:
                         raise ValueError(
                             f"{location}: no preceding request declaration for "
@@ -174,35 +214,40 @@ def read_capture(path: str | Path) -> Capture:
                             f"{location}: exchange {event.exchange_id} already has "
                             f"a final response at {exchange.response_location}"
                         )
-                    occurrence = _response_occurrence(event, exchange, location)
+                    if (
+                        event.kind == "send_response"
+                        and exchange.origin.record_key not in source_keys
+                    ):
+                        raise ValueError(
+                            f"{location}: send_response sources must include "
+                            f"its receive_request sequence "
+                            f"{exchange.origin.record_key[2]}"
+                        )
+                    occurrence = _response_occurrence(
+                        event, exchange, source_keys, location
+                    )
                     exchange.response_location = location
 
                 occurrences.append(occurrence)
+                records[occurrence.record_key] = occurrence
                 expected_seq += 1
 
     return Capture(tuple(occurrences))
 
 
-def shared_context_pairs(
-    occurrences: Iterable[Occurrence],
-) -> set[tuple[MessageLabel, MessageLabel]]:
-    groups: dict[
-        CaptureKey,
-        tuple[set[MessageLabel], set[MessageLabel]],
+def influence_edges(
+    capture: Capture,
+) -> dict[
+    tuple[MessageLabel, MessageLabel],
+    tuple[Occurrence, Occurrence],
+]:
+    records = {occurrence.record_key: occurrence for occurrence in capture.occurrences}
+    edges: dict[
+        tuple[MessageLabel, MessageLabel],
+        tuple[Occurrence, Occurrence],
     ] = {}
-    for occurrence in occurrences:
-        if occurrence.context_key is None:
-            continue
-        receives, sends = groups.setdefault(occurrence.context_key, (set(), set()))
-        destination = (
-            receives
-            if occurrence.label.kind in ("receive_request", "receive_response")
-            else sends
-        )
-        destination.add(occurrence.label)
-    return {
-        (received, sent)
-        for receives, sends in groups.values()
-        for received in receives
-        for sent in sends
-    }
+    for target in capture.occurrences:
+        for source_key in target.source_keys:
+            source = records[source_key]
+            edges.setdefault((source.label, target.label), (source, target))
+    return edges
