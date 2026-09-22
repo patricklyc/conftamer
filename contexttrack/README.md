@@ -1,9 +1,9 @@
 # ContextTrack
 
 ContextTrack instruments Go's standard-library HTTP/1 client and server and
-writes strict version 3 JSON Lines observations. The Python package validates a
+writes strict version 4 JSON Lines observations. The Python package validates a
 capture, associates each response with its exact request exchange, and displays
-possible receive-to-send influence for messages sharing a known Go context.
+only receive-to-send influence named by recorded source references.
 
 The record, label, and influence contract is in [OUTPUT.md](OUTPUT.md).
 `event.schema.json` is generated from `src/contexttrack/events.py`; it is not a
@@ -12,9 +12,10 @@ of causality, delivery, complete coverage, or crash-durable capture.
 
 ## Compatibility and boundaries
 
-Version 3 deliberately does not emit or read v1 or v2. Keep historical captures
-with their historical tooling; `testdata/v2-chain.jsonl` is retained only as a
-rejection fixture.
+Version 4 deliberately does not emit or read v1, v2, or v3. Keep historical
+captures with their historical tooling; `testdata/v2-chain.jsonl` and
+`testdata/v3-chain.jsonl` are retained only as rejection fixtures. Migration of
+applications and downstream consumers is separate from this producer and reader.
 
 Supported observations are the standard-library HTTP/1 client transport and
 server dispatch paths. Bundled HTTP/2 client or server use diagnoses
@@ -24,8 +25,8 @@ unacceptable even when it contains a valid HTTP/1 prefix.
 
 External `golang.org/x/net/http2`, custom transports, mocked handlers,
 pre-dispatch protocol rejection, hijacked or tunneled traffic, and bodies are
-not covered. API ownership, route patterns, module discovery, PMGraph
-construction, Caddy integration, and Kubernetes integration are not implemented
+not covered. API ownership, route patterns, module discovery, AppGraph
+stitching, Caddy integration, and Kubernetes integration are not implemented
 here.
 
 ## Requirements and setup
@@ -105,29 +106,73 @@ workload activity. Successful initialization prints `conftamer: enabled` to
 stderr. A passing test, valid JSON, or an empty capture does not establish that
 capture succeeded or completed.
 
-Server ingress automatically creates a context root. An autonomous client must
-use the value returned by `http.ConftamerContext` to participate in influence:
+## Declare recorded sources
+
+The producer exports three annotation names: `http.ConftamerSource`,
+`http.ConftamerWithSources`, and `http.ConftamerSetReplySources`. A source must
+be an `*http.Request` observed at server ingress or an `*http.Response` observed
+at client receipt by the enabled capture.
+
+Annotate an outgoing request with the complete set of receives that influenced
+that operation:
 
 ```go
-ctx := http.ConftamerContext(context.Background())
-req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-resp, err := http.DefaultClient.Do(req)
+outbound, err := http.NewRequestWithContext(
+    incoming.Context(), http.MethodGet, targetURL, nil,
+)
+if err != nil {
+    http.Error(w, "bad gateway", http.StatusBadGateway)
+    return
+}
+outbound = http.ConftamerWithSources(outbound, incoming)
+downstream, err := http.DefaultClient.Do(outbound)
+if err != nil {
+    http.Error(w, "bad gateway", http.StatusBadGateway)
+    return
+}
+defer downstream.Body.Close()
 ```
 
-The helper returns the input unchanged when capture is disabled. An unstamped
-client is still recorded and associated with its response, but its context is
-null and forms no influence group.
+`ConftamerWithSources` returns a shallow request copy, replaces any previous
+source declaration, and leaves the original request and its context unchanged.
+Retries retain the declaration. Redirect-created requests require a new
+explicit declaration, normally in `CheckRedirect`.
+
+Before writing final response headers, declare the complete set of additional
+receives that influenced the server reply:
+
+```go
+http.ConftamerSetReplySources(incoming, downstream)
+w.WriteHeader(downstream.StatusCode)
+```
+
+`ConftamerSetReplySources` replaces the previous additional list. The incoming
+server request is always included automatically. Informational headers do not
+freeze the declaration, but final headers do; a later declaration fails capture
+without changing the HTTP operation.
+
+Both helpers copy, sort, and deduplicate valid sources. When capture is disabled
+or already stopped they are no-ops, and `ConftamerWithSources` returns its input.
+With capture enabled, an unobserved source or invalid reply target fails capture
+rather than silently dropping a reference. An unannotated autonomous client is
+still recorded, but its send has an empty source list. Empty means unknown or
+undeclared influence, not independence.
+
+Annotations are application assertions. Review their placement and test the
+control or data dependency they represent; structural validation cannot prove
+that application code actually used a declared source.
 
 ## Inspect with the sole command
 
-Pass one process file or one capture directory:
+Pass one v4 process file or one v4 capture directory:
 
 ```bash
 uv run contexttrack "$CAPTURE"
-uv run contexttrack testdata/v3-chain.jsonl
+uv run contexttrack testdata/v4-chain.jsonl
 ```
 
-The deterministic text output includes semantic nodes, possible-influence
-edges, and occurrence/node/edge/unknown-context counts. There are no
+The unchanged v2 and v3 fixtures are expected to be rejected. The deterministic
+text output includes semantic nodes, recorded-source edges with exact occurrence
+witnesses, and occurrence/node/edge/`sends_without_sources` counts. There are no
 subcommands, format flags, compatibility wrappers, route summaries, or DOT
 mode. Use `contexttrack.capture` when occurrence-level details are needed.

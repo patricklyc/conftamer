@@ -9,10 +9,10 @@ influence rules are in [OUTPUT.md](OUTPUT.md). The paper
 provides conceptual terminology; current source, tests, and fresh captures
 determine implemented behavior.
 
-Task 1 is an explicit intermediate state: the Python package reads v4 while the
-patched Go producer remains v3 until Task 2 of
-`docs/contexttrack-v4-plan.md`. Do not claim a working v4 producer/reader pair or
-v4 producer evidence before that gate passes.
+The patched Go producer and Python package implement the v4 record format.
+Historical task boundaries in `docs/contexttrack-v4-plan.md` do not describe the
+current checkout. Do not claim reproducible builds, producer emission, or
+end-to-end acceptance without fresh evidence from the required verification.
 
 Do not claim ParamTrack, CType analysis, AppGraph stitching, execution replay,
 module ownership, API/route labeling, causality, delivery, completeness, Caddy,
@@ -37,11 +37,14 @@ sent request to its received response. An empty source list means unknown or
 undeclared influence, not independence.
 
 Version 4 removes `context_id`, capture-specific root bookkeeping, and the
-shared-context graph. The completed producer API exports only
-`ConftamerSource`, `ConftamerWithSources`, and `ConftamerSetReplySources` for
-annotation; these helpers are Task 2 work and are not implemented by the Task 1
-producer overlay. Do not infer roots, routes, APIs, organizations, modules, or
-missing messages.
+shared-context graph. The producer exports only `ConftamerSource`,
+`ConftamerWithSources`, and `ConftamerSetReplySources` for annotation.
+`ConftamerWithSources` replaces the complete outgoing-request source list;
+`ConftamerSetReplySources` replaces the additional reply sources before final
+headers, while the received request remains automatic. Disabled or stopped
+capture makes both helpers no-ops. Invalid sources, invalid reply targets, and
+late reply declarations fail capture without changing the HTTP operation.
+Do not infer roots, routes, APIs, organizations, modules, or missing messages.
 
 Preserve HTTP results, bodies, errors, cancellation, retries, redirects,
 trailers, flushing, callbacks, and caller request/context identity. Logging may

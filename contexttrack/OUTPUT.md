@@ -6,15 +6,15 @@ record models are in `src/contexttrack/events.py`. Version 1, version 2, and
 version 3 inputs are rejected; no compatibility aliases, discarded legacy
 fields, or converter are provided.
 
-This Task 1 checkout is an intentional intermediate state: the Python package
-reads v4 only, while the patched Go producer still emits v3 until Task 2 of
-`docs/contexttrack-v4-plan.md`. It is not a releasable producer/reader pair and
-must not be used to claim v4 producer evidence.
+The patched Go producer emits this format and the Python package reads it.
+That implementation state is not itself producer evidence: reproducibility,
+emission, reader integrity, and end-to-end acceptance require fresh execution
+of their separate verification gates.
 
 ## Capture and failure behavior
 
-The v4 producer retains the checked v3 logger behavior. Capture is enabled only
-when both settings exist before process startup:
+The v4 producer uses a checked synchronous logger. Capture is enabled only when
+both settings exist before process startup:
 
 ```text
 CONFTAMER_EVENTS_DIR=/absolute/path/to/an/existing-directory
@@ -106,6 +106,55 @@ contract; source declarations are not retroactive.
 Ordinary informational responses, bodies, trailers, cancellation, send errors,
 and completion have no record kind. An observation is not proof of peer
 delivery.
+
+## Source annotation API
+
+The producer adds exactly these annotation names to `net/http`:
+
+```go
+type ConftamerSource interface {
+    conftamerReceiveSeq() uint64
+}
+
+func ConftamerWithSources(
+    req *Request, sources ...ConftamerSource,
+) *Request
+
+func ConftamerSetReplySources(
+    req *Request, sources ...ConftamerSource,
+)
+```
+
+Only `*Request` and `*Response` implement `ConftamerSource`. A valid source is a
+request observed at server ingress or a response observed at client receipt by
+the enabled process capture. Callers cannot supply sequence numbers directly.
+Sources are copied, sorted, deduplicated, and recorded by their process-local
+receive sequence.
+
+`ConftamerWithSources` returns a shallow copy of `req` whose declaration
+replaces the complete source list for subsequent client attempts. It does not
+modify the original request or its context. Retries retain that declaration.
+Redirect-created requests do not inherit a new declaration automatically; code
+that treats a redirect response as a source must annotate the redirected
+request explicitly.
+
+`ConftamerSetReplySources` targets the server exchange already attached to a
+received request. Each call replaces the complete list of additional reply
+sources. The request's own receive sequence remains an automatic source and is
+added when the final response freezes. Informational headers do not freeze the
+list. The first terminal header does, so a later declaration fails capture once
+without changing the HTTP operation. Dependencies affecting only later body
+output cannot be declared retroactively.
+
+When capture is disabled or stopped, both helpers are no-ops and
+`ConftamerWithSources` returns its input unchanged. With capture enabled, a nil
+request target, an unobserved or nil source, an invalid reply target, or a late
+reply declaration fails capture rather than silently dropping or inventing a
+reference.
+
+Declarations are reviewed application assertions. Validation proves that each
+reference names a preceding receive in the process; it cannot prove that the
+application actually used that receive as data or control input.
 
 ## Identities and exact association
 
@@ -232,7 +281,8 @@ rule. Python consumers should use `EVENT_ADAPTER` and `read_capture`.
 
 The graph remains limited to selected standard-library HTTP/1 observation
 boundaries. External HTTP/2, custom transports, mocks, pre-dispatch failures,
-tunnels, and bodies may bypass it. API ownership and route patterns are absent.
-A clean diagnostic and valid records still do not prove completeness. Declared
+tunnels, and bodies may bypass it. API ownership and route patterns are absent,
+and application or downstream-consumer migration is outside this contract. A
+clean diagnostic and valid records still do not prove completeness. Declared
 sources are reviewed application assertions; structural validation cannot prove
 that application code actually used an input.
