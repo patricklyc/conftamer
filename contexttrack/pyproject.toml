@@ -1,17 +1,17 @@
 [project]
 name = "contexttrack"
 version = "0.4.0"
-description = "Add your description here"
+description = "Validate and inspect ContextTrack influence captures"
 readme = "README.md"
 requires-python = ">=3.14"
 authors = [{ name = "Patrick Lau", email = "patricklyc@berkeley.edu" }]
 dependencies = ["pydantic>=2.13.5,<3"]
 
-[dependency-groups]
-dev = ["pytest>=9.1.1"]
-
 [project.scripts]
 contexttrack = "contexttrack.inspect:main"
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]
 
 [build-system]
 requires = ["uv_build>=0.12.15,<0.13.0"]

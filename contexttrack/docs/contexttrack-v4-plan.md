@@ -1,11 +1,20 @@
 # ContextTrack v4 Implementation Plan
 
-> **Status:** Proposal for approval, not implementation authorization. Saving this
-> plan does not authorize code changes. The current v3 contract remains active
-> until a v4 implementation and its contract changes are approved.
+> **Status:** Implemented through Task 4 on branch `contexttrack-v4`:
 >
-> **For agentic workers:** Use `executing-plans`, serially, with review at each
-> gate. No delegation, commits, pushes, consumer migration, or external
+> - `32213d0` — v4 source-based influence reader;
+> - `84062b7` — v4 producer source annotations;
+> - `cd7317e` — v4 producer precision evidence; and
+> - `c525e0e` — v4 producer and annotation documentation.
+>
+> Unchecked boxes preserve the approved execution recipe; they are not a current
+> work list or durable verification evidence. Reproducibility, producer emission,
+> reader integrity, and end-to-end acceptance claims still require fresh results
+> from the verification below.
+>
+> **For agentic workers:** Follow the current `AGENTS.md`. Replaying this plan or
+> extending the implementation still requires serial execution with review at
+> each gate. No delegation, commits, pushes, consumer migration, or external
 > application suites without separate authorization.
 
 **Goal:** Record meaningful receive-to-send influence, backed by exact message
@@ -22,8 +31,8 @@ application declarations for other data/control dependencies.
 
 **Spec:** The operator's agreed edge semantics, recorded in Sections 1-3 below.
 These decisions supersede v3's Cartesian-product rule and root-annotation API
-only when implementation is approved. All other safety, identity, and
-protocol-preservation requirements remain.
+in v4. All other safety, identity, and protocol-preservation requirements
+remain.
 
 ## Global constraints
 
@@ -48,7 +57,7 @@ protocol-preservation requirements remain.
 - A passing test, valid JSON, or empty capture is not producer evidence. Inspect
   stdout, stderr, kinds, expected activity, source references, and unattributed
   sends. Never check real captures into `testdata/`.
-- Commands below are future execution instructions, not completed verification.
+- Commands below are execution requirements, not durable verification evidence.
   Restore `REPO`, `WORK`, `GO_WORK`, `PATCHED_GO`, and the `clean_go` function
   between tool calls rather than assuming shell state persists.
 
@@ -349,7 +358,8 @@ as in the existing tests.
 **Gate:** Python tests and static checks pass. Review all changed integrity
 checks and confirm that no edge is produced from context or chronology alone.
 
-The producer remains v3 until Task 2; this intermediate state is not a release.
+At this task gate the producer remains v3 until Task 2; this intermediate state
+is not a release.
 
 ### Task 2 - Producer sources and annotation helpers
 
@@ -467,8 +477,8 @@ size counts, and residual limitations.
 
 ## 6. Verification
 
-All commands below are **future execution instructions**, not results already
-obtained.
+All commands below are **verification requirements**, not persistent results.
+Run them afresh before making the corresponding acceptance claims.
 
 Run from the implementation checkout:
 
@@ -607,4 +617,6 @@ V4 is ready only when:
 7. The report separates verified behavior from annotation assumptions and
    unsupported coverage.
 
-Implementation begins only after approval of this plan.
+The implementation commits record completed work, not permanent acceptance
+evidence. Apply the current `AGENTS.md` verification rules before claiming that
+these completion criteria hold in a new checkout or environment.
