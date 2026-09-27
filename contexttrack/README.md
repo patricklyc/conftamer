@@ -18,12 +18,36 @@ where we're assigning context IDs, and where we're logging).
 
 ### Modify Go
 
-Apply [`go-inlibrary.patch`](go-inlibrary.patch) to a cloned copy of Go.
-(I directly copied the contents of `/usr/local/go` into `~/go-conftamer/`
-and applied the patch there.)
+[`go-inlibrary.patch`](go-inlibrary.patch) is generated against **Go 1.26.6**
+and tested on Linux/amd64. Apply it only to a disposable copy of that Go
+version, never to an installed Go tree or a module cache:
 
-Contexts are correlated by a monotonic ID stamped at an HTTP request's origin and
-inherited down the context chain.
+```bash
+# Run from contexttrack/; use a clean Go 1.26.6 distribution as the source.
+PATCH="$(pwd)/go-inlibrary.patch"
+cp -a /path/to/clean/go1.26.6 /path/to/go-conftamer
+cd /path/to/go-conftamer
+patch --dry-run -p4 < "$PATCH"
+patch -p4 < "$PATCH"
+
+unset GOROOT
+export GOTOOLCHAIN=local
+./bin/go version
+./bin/go env GOROOT  # must name the disposable, patched tree
+```
+
+If `patch` is unavailable, run `git apply --check -p4 "$PATCH"` and then
+`git apply -p4 "$PATCH"` from the copy's root instead. Failed hunks indicate a
+version mismatch to investigate, not something to force. Regenerate this diff
+from clean and modified Go sources when updating it; do not hand-edit hunk counts.
+
+Contexts are correlated by a monotonic, process-local ID stamped at an HTTP
+request's origin and inherited down the context chain. Group by `(pid,
+context_id)`, not by ID alone. Outbound stamping uses internal request copies in
+both `Client.Do` and direct `Transport.RoundTrip` calls; it does **not** stamp the
+caller's request in place. Redirects and contexts derived from an incoming
+request retain their inherited ID. An unstamped context logged outside these
+origins reports `context.error` without inventing a per-event ID.
 An earlier approach instead walked the context's parent
 chain to a shared root heap address; it's no longer used (false positives
 from heap-address reuse, more vulnerable to custom types) but is preserved as
@@ -82,6 +106,44 @@ Use `analysis/group_by_context.py` to see context groups and `analysis/message_g
 to generate the full, directed grah.
 
 # Running Tests
+
+## Patch regression tests
+
+The standalone module in [`tests/httpcapture/`](tests/httpcapture/) uses real
+loopback HTTP servers and has no external dependencies. With the patched Go
+1.26.6 binary, run:
+
+```bash
+# From contexttrack/; -race requires a supported platform and C compiler.
+PATCHED_GO=/absolute/path/to/go-conftamer/bin/go
+unset GOROOT
+export GOTOOLCHAIN=local
+export CONFTAMER_EVENTS="$(mktemp /tmp/contexttrack-regression.XXXXXX.jsonl)"
+cd tests/httpcapture
+"$PATCHED_GO" test -race -count=1 ./...
+```
+
+Always use a fresh capture for each invocation. These tests cover HTTP/1 and
+bundled HTTP/2, direct transports, empty methods, redirect labels and context
+inheritance, implicit/ignored/invalid HTTP/2 response headers, unstamped
+contexts, request ownership, direct-transport cancellation, and a subprocess
+with tracing disabled. The capture intentionally contains unstamped routing
+events from that negative test; downstream importers may warn about them.
+
+For a capture without the negative/ownership/cancellation cases, use another
+fresh `CONFTAMER_EVENTS` path and run:
+
+```bash
+"$PATCHED_GO" test -count=1 -run 'TestRoundTripCapture|TestRedirectLabels|TestInheritedContext' ./...
+```
+
+`Client.Do` and transport hooks may both report a received response. Bundled
+HTTP/2 logs final client response headers even when `Client.Do` is bypassed;
+HTTP/2 informational client responses and external `golang.org/x/net/http2`
+implementations are not covered by this hook. Server receipts are logged once
+at `serverHandler.ServeHTTP`; protocol-level rejects that bypass application
+handler dispatch are outside that receive hook. This is a message/context
+producer, not a complete wire capture or a PMGraph/AppGraph builder.
 
 ## Prometheus
 
