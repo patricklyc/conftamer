@@ -1,5 +1,5 @@
 diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/net/http/client.go
-index d6a8010..3747c28 100644
+index d6a8010..72c86ad 100644
 --- a/usr/local/go/src/net/http/client.go
 +++ b/home/tcr6/go-conftamer/src/net/http/client.go
 @@ -21,6 +21,7 @@ import (
@@ -10,40 +10,69 @@ index d6a8010..3747c28 100644
  	"strings"
  	"sync"
  	"sync/atomic"
-@@ -607,6 +608,12 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+@@ -607,6 +608,15 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
  	}
  	_ = *c // panic early if c is nil; see go.dev/issue/53521
  
-+	// Stamp an internal copy: redirects inherit the ID, but tracing must not
-+	// mutate the caller's request or race with readers of its context.
++	// Send the first hop with a stamped context, on a private copy only if
++	// req's context lacks an ID, and build redirects from that context. req
++	// itself is neither modified nor replaced, so Response.Request,
++	// CheckRedirect's via, and Transport.CancelRequest still use it.
++	firstReq := req
 +	if conftamerOn() {
-+		req = req.WithContext(conftamerStampID(req.Context()))
++		firstReq = conftamerStampRequest(req)
 +	}
 +
  	var (
  		deadline      = c.deadline()
  		reqs          []*Request
-@@ -739,6 +746,14 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
- 			return nil, uerr(err)
+@@ -669,7 +679,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+ 				Header:   make(Header),
+ 				Host:     host,
+ 				Cancel:   ireq.Cancel,
+-				ctx:      ireq.ctx,
++				ctx:      firstReq.ctx, // ireq.ctx, stamped when tracing
+ 			}
+ 			if includeBody && ireq.GetBody != nil {
+ 				req.Body, err = ireq.GetBody()
+@@ -728,9 +738,13 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
  		}
  
+ 		reqs = append(reqs, req)
++		sendReq := req
++		if len(reqs) == 1 {
++			sendReq = firstReq
++		}
+ 		var err error
+ 		var didTimeout func() bool
+-		if resp, didTimeout, err = c.send(req, deadline); err != nil {
++		if resp, didTimeout, err = c.send(sendReq, deadline); err != nil {
+ 			// c.send() always closes req.Body
+ 			reqBodyClosed = true
+ 			if !deadline.IsZero() && didTimeout() {
+@@ -738,6 +752,16 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+ 			}
+ 			return nil, uerr(err)
+ 		}
++		// A RoundTripper other than Transport may return the private copy.
++		conftamerRestoreRequest(resp)
++
 +		// Label this redirect hop, not the original request. resp.Status only
 +		// restates resp.StatusCode and is not logged.
 +		conftamerLog("Response received", map[string]string{
 +			"resp.StatusCode": strconv.Itoa(resp.StatusCode),
 +			"req.Method":      valueOrDefault(req.Method, MethodGet),
 +			"req.URL.Path":    req.URL.Path,
-+		}, req.Context(), nil, true, nil)
-+
++		}, sendReq.Context(), nil, true, nil)
+ 
  		var shouldRedirect, includeBodyOnHop bool
  		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, reqs[0])
- 		if !shouldRedirect {
 diff --git a/usr/local/go/src/net/http/conftamer.go b/home/tcr6/go-conftamer/src/net/http/conftamer.go
 new file mode 100644
-index 0000000..25b300b
+index 0000000..5c8caad
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,441 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -154,6 +183,11 @@ index 0000000..25b300b
 +	conftamerNextID atomic.Uint64 // Next to assign
 +)
 +
++func conftamerHasID(ctx context.Context) bool {
++	_, ok := ctx.Value(conftamerIDKey).(uint64)
++	return ok
++}
++
 +// conftamerStampID returns ctx unchanged if it already carries an ID
 +// (inherited from an ancestor), else a child context carrying a fresh
 +// monotonic ID.
@@ -161,10 +195,56 @@ index 0000000..25b300b
 +	if ctx == nil {
 +		ctx = context.Background()
 +	}
-+	if _, ok := ctx.Value(conftamerIDKey).(uint64); ok {
++	if conftamerHasID(ctx) {
 +		return ctx
 +	}
 +	return context.WithValue(ctx, conftamerIDKey, conftamerNextID.Add(1))
++}
++
++// --- private outbound request copies ----------------------------------------
++//
++// An outbound request whose context lacks an ID is sent as a private copy with
++// a stamped context: stamping the caller's request in place would race with
++// its readers. Go exposes and cancels outbound requests by pointer
++// (Response.Request, CheckRedirect's via, Transport.CancelRequest), so the copy
++// records the caller's request and Go keeps using that one.
++
++// conftamerOrigin links a private copy to the request it was made from. Copies
++// of the copy (Go's own, or an application's) inherit it, but are not the copy.
++type conftamerOrigin struct {
++	copy, orig *Request
++}
++
++// conftamerStampRequest returns r if its context already carries an ID, else a
++// private copy of r whose context carries a fresh one.
++func conftamerStampRequest(r *Request) *Request {
++	ctx := r.Context()
++	if conftamerHasID(ctx) {
++		return r
++	}
++	r2 := r.WithContext(conftamerStampID(ctx))
++	r2.conftamer = &conftamerOrigin{copy: r2, orig: r}
++	return r2
++}
++
++// conftamerOriginal returns the request r was copied from if r is a private
++// copy made by conftamerStampRequest, else r.
++func conftamerOriginal(r *Request) *Request {
++	if r != nil && r.conftamer != nil && r.conftamer.copy == r {
++		return r.conftamer.orig
++	}
++	return r
++}
++
++// conftamerRestoreRequest makes resp expose the caller's request when a
++// RoundTripper returned a private copy in its place.
++func conftamerRestoreRequest(resp *Response) {
++	if !conftamerOn() || resp == nil {
++		return
++	}
++	if orig := conftamerOriginal(resp.Request); orig != resp.Request {
++		resp.Request = orig
++	}
 +}
 +
 +// conftamerStampIDIfOn is conftamerStampID gated on the logger being enabled.
@@ -375,6 +455,15 @@ index 0000000..25b300b
 +	conftamerMu.Unlock()
 +}
 +
++// conftamerWillReject reports whether Transport.roundTrip will reject req without
++// trying to send it, so that it is not logged as sent. The checks are mirrored
++// only for requests that no alternate protocol can take first: a cached HTTP/2
++// connection, for example, sends methods that the HTTP/1 path rejects.
++func (t *Transport) conftamerWillReject(req *Request, isHTTP bool) bool {
++	return t.alternateRoundTripper(req) == nil &&
++		(!isHTTP || req.Method != "" && !validMethod(req.Method) || req.URL.Host == "")
++}
++
 +// conftamerLogRouted records the route pattern a ServeMux matched for r, logged from
 +// ServeMux.ServeHTTP because that's the only point the pattern is reliably in hand:
 +// "Request received" fires before any routing happens, and by "Response sent" a nested
@@ -426,7 +515,7 @@ index 0000000..25b300b
 +	conftamerLog(kind, msg, ctx, nil, false, nil)
 +}
 diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
-index c440e76..99e093e 100644
+index c440e76..4de6adb 100644
 --- a/usr/local/go/src/net/http/h2_bundle.go
 +++ b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
 @@ -6314,6 +6314,7 @@ func (sc *http2serverConn) newWriterAndRequestNoBody(st *http2stream, rp httpcom
@@ -454,14 +543,30 @@ index c440e76..99e093e 100644
  	// Handle informational headers
  	if code >= 100 && code <= 199 {
  		// Per RFC 8297 we must not clear the current header map
-@@ -8636,6 +8647,7 @@ func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStre
+@@ -8636,6 +8647,9 @@ func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStre
  
  	handleResponseHeaders := func() (*Response, error) {
  		res := cs.res
++		// Final headers arrived: log them even if waitDone fails below and
++		// RoundTrip returns an error instead of this response.
 +		conftamerLogResponseWire("Response received", res.StatusCode, ctx, req)
  		if res.StatusCode > 299 {
  			// On error or status code 3xx, 4xx, 5xx, etc abort any
  			// ongoing write, assuming that the server doesn't care
+diff --git a/usr/local/go/src/net/http/request.go b/home/tcr6/go-conftamer/src/net/http/request.go
+index 167cff5..817b5a7 100644
+--- a/usr/local/go/src/net/http/request.go
++++ b/home/tcr6/go-conftamer/src/net/http/request.go
+@@ -336,6 +336,9 @@ type Request struct {
+ 	pat         *pattern          // the pattern that matched
+ 	matches     []string          // values for the matching wildcards in pat
+ 	otherValues map[string]string // for calls to SetPathValue that don't match a wildcard
++
++	// conftamer is set on ContextTrack's private copies; see conftamerStampRequest.
++	conftamer *conftamerOrigin
+ }
+ 
+ // Context returns the request's context. To change the context, use
 diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/net/http/server.go
 index 6a60d94..7432a8d 100644
 --- a/usr/local/go/src/net/http/server.go
@@ -517,29 +622,38 @@ index 6a60d94..7432a8d 100644
  }
  
 diff --git a/usr/local/go/src/net/http/transport.go b/home/tcr6/go-conftamer/src/net/http/transport.go
-index 26a25d2..2064d3a 100644
+index 26a25d2..0fccd1b 100644
 --- a/usr/local/go/src/net/http/transport.go
 +++ b/home/tcr6/go-conftamer/src/net/http/transport.go
-@@ -617,6 +617,18 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
+@@ -617,10 +617,27 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
  	}
  
  	origReq := req
 +	if conftamerOn() {
-+		// Direct RoundTrip calls bypass Client.do. Keep origReq for legacy
-+		// cancellation and stamp a copy before either HTTP/1 or HTTP/2 sees it.
-+		req = req.WithContext(conftamerStampID(req.Context()))
-+		method := valueOrDefault(req.Method, MethodGet)
-+		conftamerLog("Request sent", map[string]string{
-+			"req.Method":       method,
-+			"req.URL.Host":     req.URL.Host,
-+			"req.URL.Path":     req.URL.Path,
-+			"req.URL.RawQuery": req.URL.RawQuery,
-+		}, req.Context(), &conftamerRequestID{Method: method, Host: req.URL.Host, Path: req.URL.Path}, true, nil)
++		// Direct RoundTrip calls bypass Client.do. Go exposes and cancels
++		// requests by pointer, so origReq stays the caller's request, also
++		// when req is a private copy made by Client.do.
++		req = conftamerStampRequest(req)
++		origReq = conftamerOriginal(req)
++		if !t.conftamerWillReject(req, isHTTP) {
++			method := valueOrDefault(req.Method, MethodGet)
++			conftamerLog("Request sent", map[string]string{
++				"req.Method":       method,
++				"req.URL.Host":     req.URL.Host,
++				"req.URL.Path":     req.URL.Path,
++				"req.URL.RawQuery": req.URL.RawQuery,
++			}, req.Context(), &conftamerRequestID{Method: method, Host: req.URL.Host, Path: req.URL.Path}, true, nil)
++		}
 +	}
  	req = setupRewindBody(req)
  
  	if altRT := t.alternateRoundTripper(req); altRT != nil {
-@@ -2519,6 +2531,7 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
+ 		if resp, err := altRT.RoundTrip(req); err != ErrSkipAltProtocol {
++			conftamerRestoreRequest(resp) // e.g., a cached HTTP/2 connection
+ 			return resp, err
+ 		}
+ 		var err error
+@@ -2519,6 +2536,7 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
  		if err != nil {
  			return
  		}

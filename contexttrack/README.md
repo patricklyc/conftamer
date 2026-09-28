@@ -43,11 +43,16 @@ from clean and modified Go sources when updating it; do not hand-edit hunk count
 
 Contexts are correlated by a monotonic, process-local ID stamped at an HTTP
 request's origin and inherited down the context chain. Group by `(pid,
-context_id)`, not by ID alone. Outbound stamping uses internal request copies in
-both `Client.Do` and direct `Transport.RoundTrip` calls; it does **not** stamp the
-caller's request in place. Redirects and contexts derived from an incoming
-request retain their inherited ID. An unstamped context logged outside these
-origins reports `context.error` without inventing a per-event ID.
+context_id)`, not by ID alone. The caller's request is never stamped in place:
+when an outbound request's context has no ID, `Client.Do` or a direct
+`Transport.RoundTrip` sends a private copy with a stamped context. Go still
+exposes and cancels the caller's request: `Response.Request`, `CheckRedirect`'s
+`via`, and `Transport.CancelRequest` use the original pointer. A `RoundTripper`
+other than `Transport`, a `Transport.Proxy` function, or a protocol registered
+with `Transport.RegisterProtocol` may still receive the copy. Redirects and
+contexts derived from an incoming request retain their inherited ID. An
+unstamped context logged outside these origins reports `context.error` without
+inventing a per-event ID.
 An earlier approach instead walked the context's parent
 chain to a shared root heap address; it's no longer used (false positives
 from heap-address reuse, more vulnerable to custom types) but is preserved as
@@ -126,9 +131,21 @@ cd tests/httpcapture
 Always use a fresh capture for each invocation. These tests cover HTTP/1 and
 bundled HTTP/2, direct transports, empty methods, redirect labels and context
 inheritance, implicit/ignored/invalid HTTP/2 response headers, unstamped
-contexts, request ownership, direct-transport cancellation, and a subprocess
-with tracing disabled. The capture intentionally contains unstamped routing
-events from that negative test; downstream importers may warn about them.
+contexts, request ownership, body-bearing requests, `Client.Timeout` redirects,
+caller-visible request identity (`Response.Request`, `CheckRedirect`'s `via`,
+cached HTTP/2 connections), `Transport.CancelRequest` and `Request.Cancel`,
+requests rejected before sending, and a subprocess with tracing disabled. The
+capture intentionally contains unstamped routing events from that negative
+test; downstream importers may warn about them.
+
+When changing the patch, also run the upstream `net/http` tests with tracing
+on; they check request identity and cancellation that the hooks could change:
+
+```bash
+cd /absolute/path/to/go-conftamer/src/net/http
+CONFTAMER_EVENTS="$(mktemp /tmp/contexttrack-nethttp.XXXXXX.jsonl)" \
+  "$PATCHED_GO" test -short -count=1 .
+```
 
 For a capture without the negative/ownership/cancellation cases, use another
 fresh `CONFTAMER_EVENTS` path and run:
@@ -136,6 +153,12 @@ fresh `CONFTAMER_EVENTS` path and run:
 ```bash
 "$PATCHED_GO" test -count=1 -run 'TestRoundTripCapture|TestRedirectLabels|TestInheritedContext' ./...
 ```
+
+`Request sent` records a send attempt at `Transport.RoundTrip`, even if dialing
+fails later. Requests that `Transport` rejects before any attempt (for example,
+an unsupported scheme, invalid method or header, or missing host) are not
+logged, unless an alternate protocol such as a cached HTTP/2 connection may take
+them.
 
 `Client.Do` and transport hooks may both report a received response. Bundled
 HTTP/2 logs final client response headers even when `Client.Do` is bypassed;

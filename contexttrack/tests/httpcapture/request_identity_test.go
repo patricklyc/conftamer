@@ -46,6 +46,40 @@ func TestClientDoCancelRequest(t *testing.T) {
 	}
 }
 
+// The legacy Request.Cancel channel must still reach the sent request.
+func TestClientDoLegacyCancel(t *testing.T) {
+	s := server(t, false, "/legacy-cancel", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	req, err := http.NewRequest("GET", s.URL+"/legacy-cancel", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel := make(chan struct{})
+	req.Cancel = cancel
+	resp, err := s.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	close(cancel)
+	done := make(chan error, 1)
+	go func() { _, err := io.ReadAll(resp.Body); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("expected Request.Cancel to interrupt the response body")
+		}
+	case <-time.After(3 * time.Second):
+		s.CloseClientConnections()
+		<-done
+		t.Fatal("Request.Cancel did not reach the sent request")
+	}
+}
+
 func TestCallerRequestIdentity(t *testing.T) {
 	for _, h2 := range []bool{false, true} {
 		for _, direct := range []bool{false, true} {
@@ -222,6 +256,25 @@ func TestClientNativeCopies(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A RoundTripper other than Transport may return the request it received.
+func TestRoundTripperReturnsRequest(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 204, Body: http.NoBody, Request: r}, nil
+	})}
+	req, err := http.NewRequest("GET", "http://rt.invalid/returns-request", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Request != req {
+		t.Error("Response.Request is not the caller's request")
+	}
+}
 
 // An application transport may copy the request it receives. Inherited private
 // tracing metadata must not cause that application's copy to be unwrapped.

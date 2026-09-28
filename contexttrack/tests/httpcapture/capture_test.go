@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -156,6 +157,56 @@ func TestRoundTripCapture(t *testing.T) {
 	}
 }
 
+// Body-bearing requests are wrapped for rewinding; the second request on each
+// connection exercises reuse, including the cached HTTP/2 path.
+func TestBodyRequestCapture(t *testing.T) {
+	for _, h2 := range []bool{false, true} {
+		for _, direct := range []bool{false, true} {
+			name := fmt.Sprintf("h2=%v/direct=%v", h2, direct)
+			t.Run(name, func(t *testing.T) {
+				prefix := "/body/" + name + "/"
+				s := server(t, h2, prefix, func(w http.ResponseWriter, r *http.Request) {
+					io.Copy(io.Discard, r.Body)
+					w.WriteHeader(201)
+				})
+				for i := range 2 {
+					path := prefix + fmt.Sprint(i)
+					req, err := http.NewRequest("POST", s.URL+path, strings.NewReader("payload"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					var resp *http.Response
+					if direct {
+						resp, err = s.Client().Transport.RoundTrip(req)
+					} else {
+						resp, err = s.Client().Do(req)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					resp.Body.Close()
+					if resp.StatusCode != 201 {
+						t.Fatalf("status = %d, want 201", resp.StatusCode)
+					}
+					if os.Getenv("CONFTAMER_EVENTS") == "" {
+						continue
+					}
+					sent := onlyEvent(t, path, "Request sent")
+					received := events(t, path, "Response received")
+					if sent.Context.ID == "" || len(received) == 0 {
+						t.Fatalf("missing correlation: sent=%+v received=%+v", sent, received)
+					}
+					for _, e := range received {
+						if e.Context.ID != sent.Context.ID || e.Message["req.Method"] != "POST" || e.Message["resp.StatusCode"] != "201" {
+							t.Errorf("response not correlated with its request: %+v; request: %+v", e, sent)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestHTTP2ResponseStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -225,6 +276,43 @@ func TestRedirectLabels(t *testing.T) {
 	}
 }
 
+// Client.Timeout makes Go fork each hop to add a deadline. Redirect hops must
+// share the first hop's context ID without inheriting a finished hop's deadline.
+func TestRedirectWithClientTimeout(t *testing.T) {
+	for _, h2 := range []bool{false, true} {
+		t.Run(fmt.Sprint(h2), func(t *testing.T) {
+			prefix := fmt.Sprintf("/timeout-redirect/%v/", h2)
+			s := server(t, h2, prefix, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == prefix+"a" {
+					http.Redirect(w, r, prefix+"b", 302)
+					return
+				}
+				w.WriteHeader(204)
+			})
+			client := s.Client()
+			client.Timeout = 10 * time.Second
+			req, err := http.NewRequest("GET", s.URL+prefix+"a", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 204 {
+				t.Fatalf("status = %d, want 204", resp.StatusCode)
+			}
+			if os.Getenv("CONFTAMER_EVENTS") != "" {
+				first, second := onlyEvent(t, prefix+"a", "Request sent"), onlyEvent(t, prefix+"b", "Request sent")
+				if first.Context.ID == "" || second.Context.ID != first.Context.ID {
+					t.Errorf("redirect under Client.Timeout lost the context: %+v then %+v", first, second)
+				}
+			}
+		})
+	}
+}
+
 func TestInheritedContext(t *testing.T) {
 	for _, h2 := range []bool{false, true} {
 		t.Run(fmt.Sprint(h2), func(t *testing.T) {
@@ -272,6 +360,37 @@ func TestUnstampedContext(t *testing.T) {
 	for _, e := range got {
 		if e.Context.ID != "" || e.Context.Error == "" {
 			t.Errorf("fabricated correlation for unstamped context: %+v", e)
+		}
+	}
+}
+
+// Requests that Transport rejects before trying to send them are not messages.
+func TestRejectedRequestsNotSent(t *testing.T) {
+	for _, tc := range []struct{ name, method, url string }{
+		{"relative", "GET", "/rejected/relative"},
+		{"scheme", "GET", "ftp://rejected.invalid/rejected/scheme"},
+		{"method", "BAD METHOD", "http://rejected.invalid/rejected/method"},
+		{"host", "GET", "http:///rejected/host"},
+	} {
+		for _, direct := range []bool{false, true} {
+			u, err := url.Parse(fmt.Sprintf("%s/%v", tc.url, direct))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// NewRequest would reject the invalid method itself.
+			req := &http.Request{Method: tc.method, URL: u, Header: http.Header{}}
+			transport := &http.Transport{}
+			if direct {
+				_, err = transport.RoundTrip(req)
+			} else {
+				_, err = (&http.Client{Transport: transport}).Do(req)
+			}
+			if err == nil {
+				t.Fatalf("%s: request unexpectedly succeeded", tc.name)
+			}
+			if got := events(t, u.Path, "Request sent"); len(got) != 0 {
+				t.Errorf("%s: rejected request logged as sent: %+v", tc.name, got)
+			}
 		}
 	}
 }
@@ -365,7 +484,7 @@ func TestTracingDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(executable, "-test.run=^Test(RequestOwnership|ClientDoCancelRequest|CallerRequestIdentity|CheckRedirectRequestIdentity|ClientNativeCopies|TransportWrapperCopies)$", "-test.count=1")
+	cmd := exec.Command(executable, "-test.run=^Test(RequestOwnership|ClientDoCancelRequest|ClientDoLegacyCancel|CallerRequestIdentity|CheckRedirectRequestIdentity|ClientNativeCopies|TransportWrapperCopies|RoundTripperReturnsRequest|RedirectWithClientTimeout|BodyRequestCapture)$", "-test.count=1")
 	for _, item := range os.Environ() {
 		if !strings.HasPrefix(item, "CONFTAMER_EVENTS=") {
 			cmd.Env = append(cmd.Env, item)
