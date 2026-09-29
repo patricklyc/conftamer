@@ -1,8 +1,9 @@
 # Context-Message Tracking
 
-Compile context and message tracing logic directly into a cloned copy of the
-Go standard library. Any program built with this toolchain produces a `jsonl`
-file that can be used with the scripts in `analysis/`.
+Compile context and message tracing logic directly into the Go standard
+library's `net/http`. This uses a build overlay on a stock toolchain
+([`bin/ctgo`](bin/ctgo)) or a patched clone. Any program built this way
+produces a `jsonl` file that can be used with the scripts in `analysis/`.
 
 **Goal** of this is to infer causal relationships between HTTP messages,
 i.e., "receiving this request led to sending this follow-on request."
@@ -16,30 +17,76 @@ where we're assigning context IDs, and where we're logging).
 
 ## How to Use
 
-### Modify Go
+### Use the instrumented Go
 
-[`go-inlibrary.patch`](go-inlibrary.patch) is generated against **Go 1.26.6**
-and tested on Linux/amd64. Apply it only to a disposable copy of that Go
-version, never to an installed Go tree or a module cache:
+The instrumentation targets **Go 1.26.6** and is tested on Linux/amd64. It has
+two parts, neither of which is applied to your Go installation:
+
+- [`_goroot/src/net/http/conftamer.go`](_goroot/src/net/http/conftamer.go): a
+  new `net/http` file with the hook implementations and JSONL serializer.
+  (Go ignores `_`-prefixed directories, so the `conftamer` module does not
+  build it.)
+- [`go-inlibrary.patch`](go-inlibrary.patch): the hook calls added to stock
+  `net/http` files.
+
+Run [`bin/ctgo`](bin/ctgo) wherever you would run `go`, from the target module:
 
 ```bash
-# Run from contexttrack/; use a clean Go 1.26.6 distribution as the source.
-PATCH="$(pwd)/go-inlibrary.patch"
-cp -a /path/to/clean/go1.26.6 /path/to/go-conftamer
-cd /path/to/go-conftamer
-patch --dry-run -p4 < "$PATCH"
-patch -p4 < "$PATCH"
-
-unset GOROOT
-export GOTOOLCHAIN=local
-./bin/go version
-./bin/go env GOROOT  # must name the disposable, patched tree
+export PATH="$HOME/conftamer/contexttrack/bin:$PATH"   # optional
+cd /path/to/target/module
+ctgo test ./path/to/http/package
+# ctgo: CONFTAMER_EVENTS=/tmp/contexttrack-test-20260101-120000.AbC123.jsonl
+# conftamer: enabled — writing "/tmp/contexttrack-test-...jsonl"
 ```
 
-If `patch` is unavailable, run `git apply --check -p4 "$PATCH"` and then
-`git apply -p4 "$PATCH"` from the copy's root instead. Failed hunks indicate a
-version mismatch to investigate, not something to force. Regenerate this diff
-from clean and modified Go sources when updating it; do not hand-edit hunk counts.
+`ctgo` runs `$CONFTAMER_GO` (default `go`), which must be a **stock** Go 1.26.6:
+
+- [`scripts/setup-go.sh`](scripts/setup-go.sh) copies only the files the patch
+  touches out of `go env GOROOT`, applies the patch to the copies with no fuzz,
+  adds `conftamer.go`, and writes a `go build -overlay` file mapping the stock
+  paths to those copies. The result is cached in
+  `${XDG_CACHE_HOME:-~/.cache}/conftamer/` (override with
+  `CONFTAMER_CACHE_DIR`), keyed by the Go version, GOROOT, patch, and sources,
+  and is rebuilt when any of them changes. The script refuses other Go
+  versions, a GOROOT that already contains `conftamer.go`, and a patch that
+  does not apply exactly (a version mismatch to investigate, not force).
+- Every run checks that `net/http` actually includes `conftamer.go`. An
+  overlay that does not match the GOROOT in use would otherwise silently
+  build stock `net/http`.
+- It exports `GOTOOLCHAIN=local` and appends `-overlay=...` to `GOFLAGS`, so
+  child `go` commands started by tests are instrumented too.
+- For `test` and `run`, if `CONFTAMER_EVENTS` is unset, it writes events to a
+  new file in `$CONFTAMER_EVENTS_DIR` (default `$TMPDIR` or `/tmp`) and prints
+  its path. Set `CONFTAMER_EVENTS=/path.jsonl` to choose a file (events are
+  appended), or `CONFTAMER_EVENTS=` (empty) to disable tracing.
+- For `test`, it adds `-count=1` unless you give a `-count` flag, so cached
+  results cannot produce an empty capture.
+
+The stock GOROOT is never modified; `GOROOT` may be exported as long as it
+names the Go 1.26.6 tree that the `go` command uses. To use plain `go` with the
+overlay in the current shell, run `eval "$(scripts/setup-go.sh --env)"`.
+Editors and gopls do not see the overlay. Event `file` fields name the stock
+GOROOT paths.
+
+**Fallback: a patched clone.** Some build systems override `GOFLAGS` or
+`GOTOOLCHAIN`. For those, create a patched copy of the whole toolchain:
+
+```bash
+scripts/setup-go.sh --clone /path/to/go-conftamer   # DEST must not exist
+unset GOROOT             # otherwise the clone compiles an exported GOROOT's stdlib
+export GOTOOLCHAIN=local
+/path/to/go-conftamer/bin/go env GOROOT   # must name the clone
+```
+
+Manually, this is: `cp -a` a clean Go 1.26.6, run `patch --dry-run -p4` and
+then `patch -p4 < go-inlibrary.patch` (or `git apply -p4`) from the copy's
+root, and copy `_goroot/src/net/http/conftamer.go` into its `src/net/http/`.
+Never patch an installed Go tree or a module cache in place.
+
+**Changing the instrumentation.** Edit `conftamer.go` directly. For the hook
+calls, regenerate `go-inlibrary.patch` from clean and modified Go 1.26.6
+trees. Keep the `a/usr/local/go/` and `b/home/tcr6/go-conftamer/` prefixes
+that `-p4` strips, and do not hand-edit hunks. Then run `scripts/check.sh`.
 
 Contexts are correlated by a monotonic, process-local ID stamped at an HTTP
 request's origin and inherited down the context chain. Group by `(pid,
@@ -66,7 +113,7 @@ Without this its API events get a very coarse mount point (e.g., `pattern: /api/
 Apply [`prometheus-common-route.patch`](prometheus-common-route.patch) to a writable copy of the module:
 
 ```bash
-cp -r ~/go/pkg/mod/github.com/prometheus/common@v0.69.0 ~/common-conftamer
+cp -r ~/go/pkg/mod/github.com/prometheus/common@v0.69.0 ~/common-conftamer  # a writable copy
 chmod -R u+w ~/common-conftamer
 cd ~/common-conftamer && patch -p4 < ~/conftamer/contexttrack/prometheus-common-route.patch
 ```
@@ -77,21 +124,26 @@ Then point Prometheus at it, in `~/prometheus-src/go.mod`:
 replace github.com/prometheus/common => /path/to/common-conftamer
 ```
 
-The fork calls `http.ConftamerLogRouted`, exported from the patched `net/http`.
+The fork calls `http.ConftamerLogRouted`, exported from the patched `net/http`,
+so build Prometheus with `ctgo` (or a patched clone).
 
-### Set Environment Variables
+### Environment variables
 
-- **`GOTOOLCHAIN=local`** — Without it, Go's `auto` toolchain may download
-  a new fork of Go.
-- **`CONFTAMER_EVENTS=/path/to/output.jsonl`** — where events are written.
+`ctgo` sets these for you. With plain `go` and the overlay, or with a clone,
+set them yourself:
 
-Note: when running `go test`, use `-count=1` as an argument to make sure that cached
-tests get re-run. An empty output file may be caused by a missing `-count=1`.
+- **`GOTOOLCHAIN=local`**: without it, Go's `auto` toolchain may download
+  and switch to a different Go, which is not instrumented.
+- **`CONFTAMER_EVENTS=/path/to/output.jsonl`**: where events are written.
+  Tracing is off when this is unset or empty.
+
+With plain `go test`, pass `-count=1` so that cached tests are re-run. A missing
+`-count=1` can cause an empty output file.
 
 ### Output
 
 The file is opened `O_APPEND`.
-Delete (or point `CONFTAMER_EVENTS` at a fresh path) between runs you want to analyze in isolation.
+Use a fresh path (the `ctgo` default) for each run you want to analyze in isolation.
 
 Each line looks something like this:
 
@@ -112,20 +164,50 @@ to generate the full, directed grah.
 
 # Running Tests
 
+## All checks
+
+From `contexttrack/`, with a stock Go 1.26.6 as `go` or `$CONFTAMER_GO`:
+
+```bash
+scripts/check.sh              # add --no-race without a C compiler; --clone to test clone mode
+```
+
+This runs these steps and stops at the first failure:
+
+1. Static checks: `bash -n` (and `shellcheck` if installed), `gofmt`,
+   `py_compile`, and `git diff --check`.
+2. Overlay setup and `go vet net/http` with the overlay.
+3. The tooling tests ([`tests/test_tooling.py`](tests/test_tooling.py)).
+4. The patch regression suite with `-race`.
+5. The upstream `net/http` short tests with tracing on.
+6. Both analysis scripts on the new capture and, if `../../conftamer-cli` has
+   a `node-query` branch, on its `scrape-ok.jsonl` fixture.
+
+Captures and outputs are kept in a new `/tmp/contexttrack-check.*` directory.
+The steps are described below for running them individually.
+
+## Tooling tests
+
+```bash
+python3 -m unittest tests/test_tooling.py -v   # CONTEXTTRACK_TEST_CLONE=1 to include clone mode
+```
+
+These cover:
+
+- building the overlay once, reusing it, and leaving GOROOT untouched;
+- rejecting other Go versions, patched GOROOTs, and patches that do not apply;
+- `ctgo`'s `-count=1`, capture-file, and `GOFLAGS` handling;
+- an end-to-end `ctgo run` that emits events.
+
 ## Patch regression tests
 
 The standalone module in [`tests/httpcapture/`](tests/httpcapture/) uses real
-loopback HTTP servers and has no external dependencies. With the patched Go
-1.26.6 binary, run:
+loopback HTTP servers and has no external dependencies:
 
 ```bash
 # From contexttrack/; -race requires a supported platform and C compiler.
-PATCHED_GO=/absolute/path/to/go-conftamer/bin/go
-unset GOROOT
-export GOTOOLCHAIN=local
-export CONFTAMER_EVENTS="$(mktemp /tmp/contexttrack-regression.XXXXXX.jsonl)"
 cd tests/httpcapture
-"$PATCHED_GO" test -race -count=1 ./...
+../../bin/ctgo test -race ./...   # or: CONFTAMER_EVENTS="$(mktemp ...)" /path/to/go-conftamer/bin/go test -race -count=1 ./...
 ```
 
 Always use a fresh capture for each invocation. These tests cover HTTP/1 and
@@ -142,16 +224,15 @@ When changing the patch, also run the upstream `net/http` tests with tracing
 on; they check request identity and cancellation that the hooks could change:
 
 ```bash
-cd /absolute/path/to/go-conftamer/src/net/http
-CONFTAMER_EVENTS="$(mktemp /tmp/contexttrack-nethttp.XXXXXX.jsonl)" \
-  "$PATCHED_GO" test -short -count=1 .
+cd "$(go env GOROOT)/src/net/http"   # or the clone's src/net/http
+/path/to/contexttrack/bin/ctgo test -short .
 ```
 
-For a capture without the negative/ownership/cancellation cases, use another
-fresh `CONFTAMER_EVENTS` path and run:
+For a capture without the negative, ownership, and cancellation cases, run
+this from `tests/httpcapture` (it gets a fresh capture):
 
 ```bash
-"$PATCHED_GO" test -count=1 -run 'TestRoundTripCapture|TestRedirectLabels|TestInheritedContext' ./...
+../../bin/ctgo test -run 'TestRoundTripCapture|TestRedirectLabels|TestInheritedContext' ./...
 ```
 
 `Request sent` records a send attempt at `Transport.RoundTrip`, even if dialing
@@ -170,30 +251,34 @@ producer, not a complete wire capture or a PMGraph/AppGraph builder.
 
 ## Prometheus
 
+These examples assume `ctgo` is on `PATH` (see *Use the instrumented Go*). With
+a patched clone, use its `bin/go` with `-count=1`, `GOROOT` unset,
+`GOTOOLCHAIN=local`, and `CONFTAMER_EVENTS` set. Setting `CONFTAMER_EVENTS` is
+optional with `ctgo`, which otherwise creates a fresh file per invocation.
+
 All tests:
 
 ```bash
 cd ~/prometheus-src # or Prometheus directory
-unset GOROOT   # a .bashrc-exported GOROOT silently reverts to vanilla stdlib
-export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/prom_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
 
-~/go-conftamer/bin/go test -count=1 -v ./...
+ctgo test -v ./...
 ```
 
 Or, just one test, e.g.:
 
 ```bash
-~/go-conftamer/bin/go test ./scrape/ -run TestTargetScraperScrapeOK -count=1 -v
+ctgo test ./scrape/ -run TestTargetScraperScrapeOK -v
 ```
 
-**`-count=1`**: `go test` caches results; a cached package is not re-executed by
-default. This forces each test to run once.
+**`-count=1`** (added by `ctgo`): `go test` caches results; a cached package is
+not re-executed by default. This forces each test to run once.
 
 **`-v`**: to see output from the test.
 
-**Confirming the clone is linked**: Check for this line:
+**Confirming instrumentation is active**: `ctgo` fails if the overlay is not in
+effect. The test output also contains this line:
 
 ```
 conftamer: enabled — writing "/.../prom_test.jsonl"
@@ -211,11 +296,9 @@ All integration tests:
 
 ```bash
 cd ~/caddy
-unset GOROOT
-export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/caddy_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
-~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/
+ctgo test -p 1 ./caddytest/integration/
 ```
 
 Note: use `-p 1` to disable parallelization.
@@ -225,14 +308,14 @@ actually execute parallel test processes.
 Or, just one test, e.g.:
 
 ```bash
-~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/ \
+ctgo test -p 1 ./caddytest/integration/ \
   -run TestReverseProxySubroutes
 ```
 
 Unit tests:
 
 ```bash
-~/go-conftamer/bin/go test -count=1 ./modules/caddyhttp/reverseproxy/
+ctgo test ./modules/caddyhttp/reverseproxy/
 ```
 
 ## Kubernetes
@@ -250,12 +333,10 @@ modules that we should run on.
 
 ```bash
 cd ~/kubernetes/staging/src/k8s.io/client-go
-unset GOROOT
-export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
 
-~/go-conftamer/bin/go test -count=1 ./transport/... ./rest/... ./tools/...
+ctgo test ./transport/... ./rest/... ./tools/...
 ```
 
 ### B. Integration packages (need etcd)
@@ -272,18 +353,16 @@ All tests in the endpoints integration package:
 
 ```bash
 cd ~/kubernetes
-unset GOROOT
-export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
 
-~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/
+ctgo test ./test/integration/endpoints/
 ```
 
 Or, just one test, e.g.:
 
 ```bash
-~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/ -run TestEndpointWithMultiplePods
+ctgo test ./test/integration/endpoints/ -run TestEndpointWithMultiplePods
 ```
 
 `./test/integration/endpoints` (apiserver) is the primary package.
@@ -309,12 +388,17 @@ See [`message_graph`](analysis/message_graph.py) for node/edge details.
 
 ## Notes & gotchas
 
-- **Check `GOROOT`** — if the shell exports
-  `GOROOT` (e.g. `.bashrc` lines added by version managers like `g`), the patched
-  `~/go-conftamer/bin/go` compiles against that stdlib instead of its own patched
+- **Check `GOROOT` (patched clone only)** — if the shell exports
+  `GOROOT` (e.g. `.bashrc` lines added by version managers like `g`), a patched
+  clone's `bin/go` compiles against that stdlib instead of its own patched
   one. Run `unset GOROOT` first, and verify with
-  `~/go-conftamer/bin/go env GOROOT`.
-- **`GOTOOLCHAIN=local` on every invocation** — results in empty events file
+  `/path/to/go-conftamer/bin/go env GOROOT`. `ctgo` instead overlays whichever
+  Go 1.26.6 GOROOT is in use and checks that the overlay took effect.
+- **`GOTOOLCHAIN=local` on every invocation** — without it, the events file can
+  be empty (`ctgo` sets it).
+- **Build systems that override `GOFLAGS` or `GOTOOLCHAIN`** (possibly
+  Kubernetes' `make`/`hack/` scripts) drop `ctgo`'s overlay; use a patched
+  clone for them.
 - **Stale server** (Prometheus, Caddy) — Check with `ss -tlnp | grep 9090` (Prometheus)
   or `2999` (Caddy) and kill the stale PID.
 - **`-p 1` for Caddy integration tests** — to avoid port collisions
@@ -327,11 +411,12 @@ See [`message_graph`](analysis/message_graph.py) for node/edge details.
   `WithTimeoutForNonLongRunningRequests` filter in apiserver races the request
   handler against a wall-clock deadline. If you see a `resp sent ... 504` with no matching `req received`, up `RequestTimeout` in
   `staging/src/k8s.io/apiserver/pkg/server/config.go`.
-- **Append-only output** — `rm` the file between isolated runs.
-- **First run after (re)building patched `go` is slow** — any changes to the stdlib
+- **Append-only output** — use a fresh file (the `ctgo` default) or `rm` it
+  between isolated runs.
+- **First run after changing the instrumentation is slow** — any changes to the stdlib
   require a full rebuild. `go test ./...` on a large module (e.g. all of Prometheus)
   recompiles the whole stdlib + module graph from scratch before the first test binary starts,
    which can take several minutes with no output in the meantime. Subsequent runs reuse the cache.
 - **Libraries:** HTTP/1.x and bundled HTTP/2 are instrumented.
   If a test uses a mocked library, it won't work.
-- **`-count 1`** - run all tests, even if cached.
+- **`-count=1`** - run all tests, even if cached (added by `ctgo test`).

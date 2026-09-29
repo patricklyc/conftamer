@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# ctgo: run the stock Go command with ContextTrack's net/http instrumentation.
+#
+#   ctgo test ./...        # from the target module; any go subcommand works
+#
+# - Builds or reuses the overlay (scripts/setup-go.sh), verifies it takes
+#   effect, and exports GOTOOLCHAIN=local and GOFLAGS=-overlay=... so child
+#   `go` commands started by tests inherit it.
+# - For `test` and `run`, if CONFTAMER_EVENTS is unset, writes events to a new
+#   file and reports its path on stderr. Set CONFTAMER_EVENTS= (empty) to
+#   disable tracing, or to a path to choose one (events are appended).
+# - For `test`, adds -count=1 unless a -count flag is given, so cached results
+#   cannot produce an empty capture.
+#
+# Environment: CONFTAMER_GO (Go command, default 'go'), CONFTAMER_CACHE_DIR,
+# CONFTAMER_EVENTS_DIR (directory for new capture files, default $TMPDIR or /tmp).
+set -euo pipefail
+
+self=$(readlink -f -- "${BASH_SOURCE[0]}")
+ct_dir=$(cd -- "$(dirname -- "$self")/.." && pwd)
+go_cmd=${CONFTAMER_GO:-go}
+
+env_lines=$("$ct_dir/scripts/setup-go.sh" --go "$go_cmd" --env --quiet)
+eval "$env_lines"
+
+args=("$@")
+i=0
+while ((i < ${#args[@]})); do # skip `go -C dir`
+  case ${args[i]} in
+    -C) i=$((i + 2)) ;;
+    -C=*) i=$((i + 1)) ;;
+    *) break ;;
+  esac
+done
+sub=${args[i]:-}
+
+if [[ $sub == test || $sub == run ]]; then
+  if [[ ! -v CONFTAMER_EVENTS ]]; then
+    events_dir=${CONFTAMER_EVENTS_DIR:-${TMPDIR:-/tmp}}
+    mkdir -p -- "$events_dir"
+    CONFTAMER_EVENTS=$(mktemp "$events_dir/contexttrack-$sub-$(date +%Y%m%d-%H%M%S).XXXXXX.jsonl")
+    export CONFTAMER_EVENTS
+    printf 'ctgo: CONFTAMER_EVENTS=%s\n' "$CONFTAMER_EVENTS" >&2
+  elif [[ -z $CONFTAMER_EVENTS ]]; then
+    printf 'ctgo: CONFTAMER_EVENTS is empty; tracing disabled\n' >&2
+  elif [[ -s $CONFTAMER_EVENTS ]]; then
+    printf 'ctgo: appending to non-empty %s\n' "$CONFTAMER_EVENTS" >&2
+  fi
+fi
+
+if [[ $sub == test ]]; then
+  has_count=
+  for a in "${args[@]:i+1}"; do
+    case $a in -count | -count=* | --count | --count=* | -test.count*) has_count=1 ;; esac
+  done
+  [[ -n $has_count ]] || args=("${args[@]:0:i+1}" -count=1 "${args[@]:i+1}")
+fi
+
+exec "$go_cmd" "${args[@]}"
