@@ -1,5 +1,13 @@
 """Public API for normalized ContextTrack events."""
 
+from .io import (
+    EventFileError,
+    LocatedEvent,
+    iter_events,
+    iter_raw_events,
+    normalize_file,
+    write_events,
+)
 from .models import (
     EVENT_ADAPTER,
     ContextInfo,
@@ -15,11 +23,14 @@ from .models import (
     RoutedRequestMessage,
     SentRequestMessage,
 )
+from .normalize import normalize_record
 
 __all__ = [
     "EVENT_ADAPTER",
     "ContextInfo",
     "Event",
+    "EventFileError",
+    "LocatedEvent",
     "RequestFields",
     "RequestMessage",
     "RequestReceived",
@@ -30,8 +41,9 @@ __all__ = [
     "ResponseSent",
     "RoutedRequestMessage",
     "SentRequestMessage",
+    "iter_events",
+    "iter_raw_events",
+    "normalize_file",
+    "normalize_record",
+    "write_events",
 ]
-
-
-def main() -> None:
-    print("Hello from contexttrack!")

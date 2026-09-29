@@ -3,7 +3,9 @@
 Compile context and message tracing logic directly into the Go standard
 library's `net/http`. This uses a build overlay on a stock toolchain
 ([`bin/ctgo`](bin/ctgo)) or a patched clone. Any program built this way
-produces a `jsonl` file that can be used with the scripts in `analysis/`.
+produces a raw `jsonl` file for the scripts in `analysis/` or the Python
+normalizer below. Normalization writes a separate, versioned file; it does not
+change the Go capture format.
 
 **Goal** of this is to infer causal relationships between HTTP messages,
 i.e., "receiving this request led to sending this follow-on request."
@@ -140,7 +142,7 @@ set them yourself:
 With plain `go test`, pass `-count=1` so that cached tests are re-run. A missing
 `-count=1` can cause an empty output file.
 
-### Output
+### Raw output
 
 The file is opened `O_APPEND`.
 Use a fresh path (the `ctgo` default) for each run you want to analyze in isolation.
@@ -161,6 +163,80 @@ request). Patterns therefore appear in both routers' syntaxes: `{name}` from Ser
 
 Use `analysis/group_by_context.py` to see context groups and `analysis/message_graph.py`
 to generate the full, directed grah.
+
+### Install the Python normalizer
+
+The Python package is **ContextTrack 0.2.0**, requiring Python >=3.14 and
+Pydantic >=2.13.5,<3. Its normalized event format is independently versioned as
+**schema version 1**. See [OUTPUT.md](OUTPUT.md) for the authoritative wire/API
+contract, field mapping, validation, and file-safety rules.
+
+With [uv](https://docs.astral.sh/uv/), from `contexttrack/`:
+
+```bash
+uv python install 3.14
+uv sync --locked --dev
+uv run contexttrack --help
+```
+
+To install in a separate, existing Python 3.14+ environment, build a wheel
+outside the checkout and install it there:
+
+```bash
+DIST=$(mktemp -d /tmp/contexttrack-dist.XXXXXX)
+uv build --wheel --out-dir "$DIST"
+uv pip install --python /path/to/venv/bin/python "$DIST"/contexttrack-0.2.0-*.whl
+```
+
+That environment provides `contexttrack`, `python -m contexttrack`, and the
+public typed Python API, without needing Go or the consumer repository.
+Downstream consumers should pin a tested artifact/version in their lockfile;
+registry publication and consumer migration are separate work.
+
+### Normalize a completed raw capture
+
+Stop the captured program or tests before reading the raw file. Normalize it
+into a **new output file in an existing directory**, keeping the raw capture
+for auditing:
+
+```bash
+uv run contexttrack normalize /path/to/raw.jsonl --output /path/to/new-normalized.jsonl
+# Equivalent module entry point, using a different new output:
+uv run python -m contexttrack normalize /path/to/raw.jsonl --output /path/to/new-module.jsonl
+uv run contexttrack schema     # generated normalized v1 JSON Schema on stdout
+```
+
+In an installed environment, omit `uv run`. Paths are explicit: there is no
+append, overwrite, skip-bad, or stdout-output mode. Successful normalization is
+silent and exits 0. Expected input/filesystem errors exit 2 with a stderr
+diagnostic and no traceback; invalid input cannot publish a partial output.
+
+Consumers can normalize a raw capture **in memory**, or read a normalized file:
+
+```python
+from contexttrack.io import iter_events, iter_raw_events
+from contexttrack.models import RequestSent
+
+for record in iter_raw_events("raw.jsonl"):  # raw input, no intermediate file
+    event = record.event
+    print(record.location, event.kind, event.context_key)
+    if isinstance(event, RequestSent):
+        print(event.message.method, event.message.host, event.message.path)
+
+for record in iter_events("normalized.jsonl"):  # normalized v1 input only
+    print(record.location, record.event.kind, record.event.context_key)
+```
+
+Both readers yield the same immutable event models in capture order, preserving
+incomplete observations and repeated hooks; locations refer to the file actually
+read. They do not auto-detect formats. Normalization does not associate requests,
+reconstruct routes, or build a PMGraph/AppGraph; those remain downstream steps.
+It is not redaction or proof of capture completeness. An empty capture produces
+an empty normalized file, not evidence of useful instrumented traffic.
+
+**Existing `analysis/` commands and the `conftamer-cli/node-query` importer still
+require raw captures. Do not pass normalized files to them.** Their raw examples
+below remain unchanged; migrating those consumers is not part of this release.
 
 # Running Tests
 

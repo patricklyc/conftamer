@@ -1,16 +1,14 @@
 [project]
 name = "contexttrack"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Typed normalization of ContextTrack HTTP captures"
 readme = "README.md"
 requires-python = ">=3.14"
 authors = [{ name = "Patrick Lau", email = "patricklyc@berkeley.edu" }]
-dependencies = [
-  "pydantic>=2.13.5",
-]
+dependencies = ["pydantic>=2.13.5,<3"]
 
 [project.scripts]
-contexttrack = "contexttrack:main"
+contexttrack = "contexttrack.cli:main"
 
 [dependency-groups]
 dev = [

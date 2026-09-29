@@ -4,12 +4,13 @@ This document defines the public **normalized event schema, version 1**, impleme
 in [`src/contexttrack/models.py`](src/contexttrack/models.py). It is distinct from
 the unversioned raw Go capture described in the [README](README.md).
 
-**Current scope (Tasks 1–3):** typed models, validation, serialization, a typing
-marker, pure raw-record normalization, and strict streaming JSONL readers/writers.
-The normalization CLI, generated schema snapshot, and package release update are
-later tasks and are not implemented yet. Go instrumentation and raw captures
-are unchanged. The existing `analysis/` scripts and `conftamer-cli/node-query`
-importer still require raw input, not these models' normalized JSON.
+**Current scope (Tasks 1–4):** typed models, validation, serialization, a typing
+marker, pure raw-record normalization, strict streaming JSONL readers/writers,
+normalization/schema CLIs, and package version `0.2.0`. The generated schema
+snapshot and full producer/distribution acceptance remain Task 5. Go
+instrumentation and raw captures are unchanged. The existing `analysis/` scripts
+and `conftamer-cli/node-query` importer still require raw input, not these models'
+normalized JSON.
 
 ## Purpose and boundaries
 
@@ -304,11 +305,42 @@ iter_raw_events(source)), output)`: it has no separate normalization or error
 wrapping logic. Empty input publishes a valid empty output with count zero;
 that is not evidence of useful instrumented traffic.
 
+## Command line
+
+```text
+contexttrack normalize INPUT --output NEW_OUTPUT
+contexttrack schema
+python -m contexttrack normalize INPUT --output NEW_OUTPUT
+```
+
+The installed console command and module command share
+[`contexttrack.cli.main(argv: Sequence[str] | None = None) -> int`](src/contexttrack/cli.py).
+The CLI delegates normalization to `normalize_file`; it has no separate field
+mapping, validation, or request-association logic. `normalize` accepts completed
+**raw captures only**, never normalized data or mixed/auto-detected formats.
+There are no default paths, append/overwrite flag, lenient/skip-bad option, or
+stdout-output mode. The existing-directory, new-file and atomic-publication
+rules above apply unchanged.
+
+Successful normalization returns 0 with empty stdout/stderr. Expected input or
+filesystem failures return 2 with a useful stderr diagnostic and no traceback;
+input diagnostics retain the raw path and physical line. Argument errors use
+argparse's stderr diagnostics and exit 2. Help exits 0.
+
+`schema` prints `EVENT_ADAPTER.json_schema()` as sorted, two-space-indented UTF-8
+JSON with a final newline and no other stdout content. It works from the
+installed package without a checkout or schema snapshot. Package version
+`0.2.0` and normalized schema version `1` are independent; no registry
+publication or downstream consumer migration is implied.
+
 ## Public Python API
 
 `contexttrack.models` and the package root export `ContextInfo`, `RequestFields`,
 `RequestMessage`, `SentRequestMessage`, `RoutedRequestMessage`, `ResponseMessage`,
-all five concrete event classes, `Event`, and `EVENT_ADAPTER`.
+all five concrete event classes, `Event`, and `EVENT_ADAPTER`. The package root
+also exports `normalize_record` and all documented `contexttrack.io` interfaces:
+`LocatedEvent`, `EventFileError`, `iter_raw_events`, `iter_events`, `write_events`,
+and `normalize_file`. Importing the package root does not import the CLI.
 
 `Event` is an `Annotated` discriminated union, not a class with
 `model_validate_json`. Use `EVENT_ADAPTER` or a concrete event model:
@@ -372,8 +404,9 @@ there is no independently maintained normalized validator.
 
 Imports do not read capture environment variables, emit diagnostics, open
 captures, import graph code, or require Go or the consumer repository. The
-package includes `py.typed` and requires Python >=3.14. Models, record
-normalization, and I/O are tested on Python 3.14.7 with Pydantic 2.13.5.
+package includes `py.typed` and requires Python >=3.14 and Pydantic >=2.13.5,<3.
+Models, record normalization, I/O, and CLI are tested on Python 3.14.7 with
+Pydantic 2.13.5.
 Python/Pydantic, the Go toolchain used to produce raw evidence, and uv/build/test
 tooling are external trust boundaries; these tests do not audit their third-party
 source.
