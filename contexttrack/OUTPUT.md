@@ -4,10 +4,10 @@ This document defines the public **normalized event schema, version 1**, impleme
 in [`src/contexttrack/models.py`](src/contexttrack/models.py). It is distinct from
 the unversioned raw Go capture described in the [README](README.md).
 
-**Current scope (Tasks 1–2):** typed models, validation, serialization, a typing
-marker, and pure raw-record normalization. JSONL readers/writers, the
-normalization CLI, the generated schema snapshot, and the package release update
-are later tasks and are not implemented yet. Go instrumentation and raw captures
+**Current scope (Tasks 1–3):** typed models, validation, serialization, a typing
+marker, pure raw-record normalization, and strict streaming JSONL readers/writers.
+The normalization CLI, generated schema snapshot, and package release update are
+later tasks and are not implemented yet. Go instrumentation and raw captures
 are unchanged. The existing `analysis/` scripts and `conftamer-cli/node-query`
 importer still require raw input, not these models' normalized JSON.
 
@@ -56,10 +56,12 @@ observations; validation does not deduplicate or order them.
   as `0`, `200`, and `999` are accepted; there is no 100-599 restriction. Raw
   status-string conversion is not performed by these models.
 
-The intended normalized file format is UTF-8 JSONL, with one event object and a
-newline per record. The model adapter parses a single event, not a JSONL file;
+The normalized file format is UTF-8 JSONL, with one event object and a newline
+per serialized record. The model adapter parses a single event, not a JSONL file;
 encoding, duplicate-key checks, physical-line diagnostics, and safe file
-publication belong to the later I/O task.
+publication are provided by [`contexttrack.io`](src/contexttrack/io.py). Direct
+`EVENT_ADAPTER.validate_json` validates model shape but does not provide those
+additional file-level checks.
 
 ## Envelope
 
@@ -220,8 +222,87 @@ still decides which evidence can become PMGraph nodes and how to associate it.
 
 Malformed raw shapes raise Pydantic `ValidationError` (a `ValueError` subclass);
 invalid decimal status strings raise `ValueError`. The final public
-`EVENT_ADAPTER` validates the constructed canonical payload. Physical file/line
-error wrapping is part of the later I/O task, not this record-only API.
+`EVENT_ADAPTER` validates the constructed canonical payload. The record-only API
+has no file location; the JSONL readers wrap these failures at their physical
+input line as described below.
+
+## Streaming JSONL I/O
+
+The public interfaces in [`contexttrack.io`](src/contexttrack/io.py) accept
+`str` or `pathlib.Path` file paths:
+
+```text
+iter_raw_events(path: str | Path) -> Iterator[LocatedEvent]
+iter_events(path: str | Path) -> Iterator[LocatedEvent]
+write_events(events: Iterable[Event], output: str | Path) -> int
+normalize_file(source: str | Path, output: str | Path) -> int
+```
+
+### Readers and locations
+
+- `iter_raw_events` lazily reads a **completed raw capture** and applies
+  `normalize_record` to each record in memory. It writes nothing and does not
+  modify the capture. There is no tailing or capture-runner behavior; stop capture
+  before reading. Normalization cannot detect mixed runs or prove completeness.
+- `iter_events` lazily reads **normalized v1 only**, validating through
+  `EVENT_ADAPTER`. Readers do not auto-detect or mix formats: raw input to
+  `iter_events`, or normalized input to `iter_raw_events`, is an error.
+- Both readers share one byte-line JSONL parser. Each physical line is decoded
+  with strict UTF-8, so even decoding failures have the correct line number. Blank
+  lines are skipped; empty/blank-only files and valid final records without a
+  trailing newline are accepted.
+- Malformed JSON, non-object records, a UTF-8 BOM, non-finite constants such as
+  `NaN`/`Infinity`, and duplicate keys at any object depth are rejected. Model
+  types/fields/versions are validated by the appropriate Pydantic adapter, not
+  a second handwritten normalized schema.
+- Records stream in file order, retaining incomplete observations and repeated
+  hooks. No association, enrichment, filtering, deduplication, or sorting occurs;
+  file order is not asserted to be a global causal order.
+
+Each reader yields a frozen `LocatedEvent` dataclass with `event: Event`,
+`path: Path`, and `line: int`. Its `location` property is `f"{path}:{line}"`.
+The line is the one-based **physical input line**, including skipped blanks in
+its count, not the event's optional Go source/debug `line`. Locations name the
+file actually read and are never serialized into the captured event. For the
+same capture, raw reading and normalization followed by normalized reading yield
+equal events in equal order; their paths/physical lines can differ.
+
+`EventFileError(ValueError)` stores `path`, `line`, and `reason`; its string begins
+with `path:line:`. JSON, UTF-8, raw normalization, and Pydantic input failures are
+wrapped with the original exception as `__cause__`. Filesystem failures remain
+`OSError` subclasses; programming errors are not treated as malformed records.
+A reader may already have yielded valid earlier events when a later line fails.
+
+### Writer and file normalization
+
+`write_events` validates every outgoing value through `EVENT_ADAPTER`, including
+model instances created with unchecked Pydantic construction/copy helpers. It
+then serializes the validated model with
+`model_dump_json(by_alias=False, exclude_none=False, ensure_ascii=False)` and one
+final newline. Output contains explicit nulls and literal UTF-8 Unicode, not raw
+dict dumping or reader location metadata. Memory use is bounded per record, not
+per capture. The return value counts events, including repeated hooks.
+
+Output must be a **new file in an existing directory**. Existing files,
+directories, and symlinks (including dangling symlinks) are never overwritten or
+followed for writing. Output equal to the input is rejected. No append, overwrite,
+parent-directory creation, or raw-file rewrite mode is provided.
+
+The writer uses a temporary file on the output filesystem, validates and writes
+the entire stream, closes it, then publishes with `os.link(temp_path,
+output_path)`. This is atomic no-clobber publication: an existence precheck is
+only an optimization, and a destination created by another writer before the
+link is preserved. The temporary name is removed on success or failure. Decode,
+validation, serialization, write, or close failure before publication leaves no
+output file, rather than a success-looking prefix. If hard links are unsupported,
+the filesystem error is reported; there is no `os.replace` fallback that could
+overwrite user data. These guarantees assume a supported local filesystem and
+are not crash-durability or network-filesystem guarantees.
+
+`normalize_file` is exactly `write_events((record.event for record in
+iter_raw_events(source)), output)`: it has no separate normalization or error
+wrapping logic. Empty input publishes a valid empty output with count zero;
+that is not evidence of useful instrumented traffic.
 
 ## Public Python API
 
@@ -269,19 +350,35 @@ assert event.api_id is None
 assert event.context_key is None
 ```
 
+For file-based use, import the I/O API from `contexttrack.io`; raw and normalized
+files have explicit, separate entry points:
+
+```python
+from contexttrack.io import iter_events, iter_raw_events, normalize_file
+
+for record in iter_raw_events("raw.jsonl"):
+    print(record.location, record.event.kind, record.event.context_key)
+
+count = normalize_file("raw.jsonl", "new-normalized.jsonl")
+for record in iter_events("new-normalized.jsonl"):
+    print(record.location, record.event.kind, record.event.context_key)
+```
+
 Serialization includes all nullable fields as explicit nulls, preserves Unicode,
-and excludes `context_key`. Add a newline when writing an individual JSONL record.
+and excludes `context_key`. Use `write_events` for safe JSONL publication; add a
+newline when serializing an individual record yourself.
 `EVENT_ADAPTER.json_schema()` provides the schema derived from these same models;
 there is no independently maintained normalized validator.
 
 Imports do not read capture environment variables, emit diagnostics, open
 captures, import graph code, or require Go or the consumer repository. The
-package includes `py.typed` and requires Python >=3.14. Models and record
-normalization are tested on Python 3.14.7 with Pydantic 2.13.5. Python/Pydantic,
-the Go toolchain used to produce raw evidence, and uv/build/test tooling are
-external trust boundaries; these tests do not audit their third-party source.
+package includes `py.typed` and requires Python >=3.14. Models, record
+normalization, and I/O are tested on Python 3.14.7 with Pydantic 2.13.5.
+Python/Pydantic, the Go toolchain used to produce raw evidence, and uv/build/test
+tooling are external trust boundaries; these tests do not audit their third-party
+source.
 
 Query strings, context diagnostics, and source paths may contain sensitive
 information. Model validation is not redaction or proof of capture completeness.
-Complete-project human audit and sign-off remain pending; automated model tests
-are not a substitute for that review.
+Complete-project human audit and sign-off remain pending; automated checks are
+not a substitute for that review.
