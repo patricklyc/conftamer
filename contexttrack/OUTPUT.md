@@ -4,13 +4,12 @@ This document defines the public **normalized event schema, version 1**, impleme
 in [`src/contexttrack/models.py`](src/contexttrack/models.py). It is distinct from
 the unversioned raw Go capture described in the [README](README.md).
 
-**Current scope (Task 1):** typed models, validation, serialization, and a typing
-marker. Raw-record normalization, JSONL readers/writers, the normalization CLI,
-the generated schema snapshot, and the package release update are later tasks;
-they are not implemented by this contract-only change. Go instrumentation and
-raw captures are unchanged. The existing `analysis/` scripts and
-`conftamer-cli/node-query` importer still require raw input, not these models'
-normalized JSON.
+**Current scope (Tasks 1–2):** typed models, validation, serialization, a typing
+marker, and pure raw-record normalization. JSONL readers/writers, the
+normalization CLI, the generated schema snapshot, and the package release update
+are later tasks and are not implemented yet. Go instrumentation and raw captures
+are unchanged. The existing `analysis/` scripts and `conftamer-cli/node-query`
+importer still require raw input, not these models' normalized JSON.
 
 ## Purpose and boundaries
 
@@ -129,8 +128,100 @@ examples include `GET /items/{id}`, `:name`, and `*path`.
 Requests reject `status_code`; responses reject `host`, `raw_query`, and
 `pattern`. Routing rejects request-query and host fields. No event carries a
 wire `request_id`: outbound method/host/path are endpoint labels in the typed
-message, not occurrence or correlation IDs. Raw-to-normalized field precedence
-and conversion will be implemented and documented in the normalization task.
+message, not occurrence or correlation IDs. The normalizer uses the raw
+`request_id` as the sole source of those outbound endpoint labels.
+
+## Raw-record normalization
+
+[`contexttrack.normalize.normalize_record(record: object) -> Event`](src/contexttrack/normalize.py)
+validates and converts **one current unversioned `contexttrack-fix-v1` raw
+record** into an immutable normalized v1 event. The same raw format is retained
+by the overlay tooling. This API is not an importer for historical root-address
+or v2/v3/v4/v5 experiments, and already-normalized records are not raw input.
+
+### Mapping
+
+| Raw kind | Canonical kind | Method/path source | Other payload evidence |
+| --- | --- | --- | --- |
+| `Request sent` | `send_request` | `request_id.method` / `request_id.path` | `request_id.host` and `message.req.URL.RawQuery` |
+| `Request received` | `receive_request` | `message.req.Method` / `message.req.URL.Path` | `message.req.URL.RawQuery` |
+| `Request routed` | `request_routed` | `message.req.Method` / `message.req.URL.Path` | `message.pattern`, unchanged |
+| `Response sent` | `send_response` | `message.req.Method` / `message.req.URL.Path` | `message.code` converted to `status_code` |
+| `Response received` | `receive_response` | `message.req.Method` / `message.req.URL.Path` | `message.resp.StatusCode` converted to `status_code` |
+
+- **Outbound-label precedence:** method, host, and path come only from
+  `request_id`, even when duplicate labels in the raw `message` disagree.
+  Missing/null/empty-object `request_id`, or omitted fields within it, leave
+  those labels null; the normalizer never falls back to `message`. Duplicate
+  raw message fields still undergo strict validation. Keep the untouched raw
+  capture for auditing disagreements. `request_id` is an endpoint label, not an
+  occurrence ID, and is not serialized in the normalized envelope.
+- A present empty path `""` becomes `"/"` for every kind. An omitted path
+  stays null. Empty methods/hosts are preserved rather than given defaults.
+- Request query strings retain Unicode and the distinction between omitted
+  (null) and explicitly empty (`""`). They come from the raw message, not
+  `request_id`.
+- A present response status must be a string satisfying `str.isdecimal()`;
+  conversion uses `int()`. Leading zeros are accepted (`"0200"` becomes `200`),
+  as are Unicode decimal digits. Numeric JSON values, booleans, empty strings,
+  signs, whitespace, decimal points, and nondecimal strings are rejected.
+  There is no 100-599 restriction: `"0"`, informational `"103"`, and
+  nonstandard `"999"` are accepted. Omitted statuses remain null.
+- `pid`, `api_id`, `handler`, `goroutine_id`, `thread_id`, `file`, and `line`
+  retain their values; missing optional fields become null. Zero debug values
+  stay zero. Context preserves all four known diagnostic fields. An omitted or
+  null context object becomes an all-null `ContextInfo`, without fabricating
+  identity.
+- No other values are normalized: methods are not uppercased, hosts are not
+  lowercased, strings/API IDs are not trimmed, and URLs/paths/query strings
+  are not decoded, cleaned, or stripped. Route syntax is preserved separately
+  from the concrete path, not reconstructed.
+
+### Strict raw boundary
+
+Private Pydantic models in [`_raw.py`](src/contexttrack/_raw.py) use strict types
+and forbid unknown fields at every level. Raw `kind`, integer `pid`, and object
+`message` are required. `message={}` is valid incomplete evidence; a missing,
+null, or non-object message is invalid. Context and request-label objects, API
+IDs, and optional debug metadata may be omitted/null. Existing PID/debug integer
+fields have no new positivity restrictions.
+
+Known message and `request_id` fields must be **strings when explicitly
+present**; explicit null is invalid, even for unused duplicate outbound labels.
+Omission is allowed and becomes null evidence. Context fields and optional
+envelope metadata, by contrast, accept explicit null with their declared types.
+
+Only these raw message keys are allowed for each kind:
+
+| Raw kind | Allowed `message` keys |
+| --- | --- |
+| `Request sent` | `req.Method`, `req.URL.Host`, `req.URL.Path`, `req.URL.RawQuery` |
+| `Request received` | `req.Method`, `req.URL.Path`, `req.URL.RawQuery` |
+| `Request routed` | `req.Method`, `req.URL.Path`, `pattern` |
+| `Response sent` | `req.Method`, `req.URL.Path`, `code` |
+| `Response received` | `req.Method`, `req.URL.Path`, `resp.StatusCode` |
+
+`request_id` permits only `method`, `host`, and `path`. A non-null `request_id`
+is legal only on `Request sent`; even `{}` is forbidden on other kinds. Null
+is permitted on all five kinds. Dotted message keys are validation aliases,
+not alternate names: canonical/internal spellings such as `method`, `path`,
+and `status_code` are not accepted as raw message keys. `context.root_addr`
+and unknown raw kinds/envelope/nested keys fail explicitly; they are not
+silently ignored. This boundary is intentionally stricter than the diagnostic
+scripts and the legacy `node-query` importer's tolerance of some unconsumed
+fields.
+
+Each accepted raw record yields exactly one typed event. Conversion does not
+mutate the input, read/write files, warn, cache requests, infer associations,
+filter, deduplicate, or sort records. Repeated hooks and incomplete observations
+remain evidence. Responses are not enriched from other records, and no API ID,
+handler, host, route pattern, or module ownership is invented. Downstream code
+still decides which evidence can become PMGraph nodes and how to associate it.
+
+Malformed raw shapes raise Pydantic `ValidationError` (a `ValueError` subclass);
+invalid decimal status strings raise `ValueError`. The final public
+`EVENT_ADAPTER` validates the constructed canonical payload. Physical file/line
+error wrapping is part of the later I/O task, not this record-only API.
 
 ## Public Python API
 
@@ -159,6 +250,25 @@ text = event.model_dump_json(by_alias=False, exclude_none=False, ensure_ascii=Fa
 assert EVENT_ADAPTER.validate_json(text) == event
 ```
 
+For raw input, import the record normalizer; no graph code or other records are
+needed, even for an incomplete response:
+
+```python
+from contexttrack.models import ResponseReceived
+from contexttrack.normalize import normalize_record
+
+event = normalize_record({
+    "kind": "Response received",
+    "pid": 42,
+    "message": {"resp.StatusCode": "0200"},
+})
+assert isinstance(event, ResponseReceived)
+assert event.message.status_code == 200
+assert event.message.path is None
+assert event.api_id is None
+assert event.context_key is None
+```
+
 Serialization includes all nullable fields as explicit nulls, preserves Unicode,
 and excludes `context_key`. Add a newline when writing an individual JSONL record.
 `EVENT_ADAPTER.json_schema()` provides the schema derived from these same models;
@@ -166,10 +276,10 @@ there is no independently maintained normalized validator.
 
 Imports do not read capture environment variables, emit diagnostics, open
 captures, import graph code, or require Go or the consumer repository. The
-package includes `py.typed` and requires Python >=3.14. Task 1 is tested on
-Python 3.14.7 with Pydantic 2.13.5. Python/Pydantic, the Go toolchain used to
-produce raw evidence, and uv/build/test tooling are external trust boundaries;
-these tests do not audit their third-party source.
+package includes `py.typed` and requires Python >=3.14. Models and record
+normalization are tested on Python 3.14.7 with Pydantic 2.13.5. Python/Pydantic,
+the Go toolchain used to produce raw evidence, and uv/build/test tooling are
+external trust boundaries; these tests do not audit their third-party source.
 
 Query strings, context diagnostics, and source paths may contain sensitive
 information. Model validation is not redaction or proof of capture completeness.

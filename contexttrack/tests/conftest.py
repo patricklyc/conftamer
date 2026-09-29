@@ -1,4 +1,4 @@
-"""Synthetic fixtures for the normalized event contract."""
+"""Synthetic raw captures and normalized event fixtures."""
 
 import pytest
 
@@ -16,4 +16,22 @@ def normalized_sent():
             "path": "/",
             "raw_query": "",
         },
+    }
+
+
+@pytest.fixture
+def raw_sent():
+    return {
+        "kind": "Request sent",
+        "pid": 42,
+        "thread_id": 0,
+        "context": {"context_id": "id:7"},
+        "api_id": " API\n",
+        "message": {
+            "req.Method": "gEt",
+            "req.URL.Host": "Höst:80",
+            "req.URL.Path": "",
+            "req.URL.RawQuery": "",
+        },
+        "request_id": {"method": "gEt", "host": "Höst:80", "path": ""},
     }
