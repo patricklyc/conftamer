@@ -169,7 +169,9 @@ to generate the full, directed grah.
 The Python package is **ContextTrack 0.2.0**, requiring Python >=3.14 and
 Pydantic >=2.13.5,<3. Its normalized event format is independently versioned as
 **schema version 1**. See [OUTPUT.md](OUTPUT.md) for the authoritative wire/API
-contract, field mapping, validation, and file-safety rules.
+contract, field mapping, validation, and file-safety rules. The reviewable
+[JSON Schema snapshot](schemas/contexttrack-event-v1.schema.json) is generated
+from the same public models; installed packages expose it with `contexttrack schema`.
 
 With [uv](https://docs.astral.sh/uv/), from `contexttrack/`:
 
@@ -237,10 +239,37 @@ an empty normalized file, not evidence of useful instrumented traffic.
 **Existing `analysis/` commands and the `conftamer-cli/node-query` importer still
 require raw captures. Do not pass normalized files to them.** Their raw examples
 below remain unchanged; migrating those consumers is not part of this release.
+The [consumer handoff](OUTPUT.md#consumer-handoff-separately-authorized-work)
+keeps the consumer on one raw-input path via `iter_raw_events`, without a
+required normalization pre-step, and requires separate authorization/testing.
+
+Normalized records can contain raw query strings and source paths. Normalization
+is not redaction, a PMGraph/AppGraph builder, or proof of capture completeness.
 
 # Running Tests
 
-## All checks
+## Python package and published schema
+
+From `contexttrack/`:
+
+```bash
+uv sync --locked --dev
+uv run pytest -q
+uv run pytest -q tests/test_schema.py   # committed snapshot must match the models
+```
+
+After an intentional model/schema change, regenerate the snapshot with
+`uv run contexttrack schema > schemas/contexttrack-event-v1.schema.json` and
+rerun the drift test; do not hand-maintain a second validator.
+
+[Task 5 acceptance and audit handoff](docs/contexttrack-normalized-events-task5.md)
+records scoped ty/Ruff/Tombi checks, committed-fixture and isolated-wheel
+verification at Pydantic 2.13.5, fresh Go 1.26.6 capture evidence, and outstanding
+findings. These are separate gates: `scripts/check.sh` below does not run the
+normalizer's pytest/type/lint/format or installed-wheel checks. Complete-project
+human audit/sign-off remains pending, regardless of automated test results.
+
+## All capture/tooling checks
 
 From `contexttrack/`, with a stock Go 1.26.6 as `go` or `$CONFTAMER_GO`:
 

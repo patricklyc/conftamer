@@ -4,13 +4,16 @@ This document defines the public **normalized event schema, version 1**, impleme
 in [`src/contexttrack/models.py`](src/contexttrack/models.py). It is distinct from
 the unversioned raw Go capture described in the [README](README.md).
 
-**Current scope (Tasks 1–4):** typed models, validation, serialization, a typing
-marker, pure raw-record normalization, strict streaming JSONL readers/writers,
-normalization/schema CLIs, and package version `0.2.0`. The generated schema
-snapshot and full producer/distribution acceptance remain Task 5. Go
+**Published interface:** ContextTrack `0.2.0` provides typed models, pure
+raw-record normalization, strict streaming JSONL readers/writers, normalization
+and schema CLIs, a typing marker, and a
+[model-generated schema snapshot](schemas/contexttrack-event-v1.schema.json).
+Package version `0.2.0` is independent of normalized schema version `1`. Go
 instrumentation and raw captures are unchanged. The existing `analysis/` scripts
-and `conftamer-cli/node-query` importer still require raw input, not these models'
-normalized JSON.
+and `conftamer-cli/node-query` importer still require raw input, not normalized
+JSON. [Task 5 acceptance and audit status](docs/contexttrack-normalized-events-task5.md)
+separates unit, committed-fixture, installed-wheel, and native-producer evidence
+from the still-pending complete-project human sign-off.
 
 ## Purpose and boundaries
 
@@ -405,13 +408,102 @@ there is no independently maintained normalized validator.
 Imports do not read capture environment variables, emit diagnostics, open
 captures, import graph code, or require Go or the consumer repository. The
 package includes `py.typed` and requires Python >=3.14 and Pydantic >=2.13.5,<3.
-Models, record normalization, I/O, and CLI are tested on Python 3.14.7 with
-Pydantic 2.13.5.
-Python/Pydantic, the Go toolchain used to produce raw evidence, and uv/build/test
-tooling are external trust boundaries; these tests do not audit their third-party
-source.
 
-Query strings, context diagnostics, and source paths may contain sensitive
-information. Model validation is not redaction or proof of capture completeness.
-Complete-project human audit and sign-off remain pending; automated checks are
-not a substitute for that review.
+## Published JSON Schema
+
+[`schemas/contexttrack-event-v1.schema.json`](schemas/contexttrack-event-v1.schema.json)
+is the sorted, indented snapshot of `EVENT_ADAPTER.json_schema()`, not an
+independent handwritten validator. It describes one normalized event object,
+not an entire JSONL file. Generate it and check for model/snapshot drift with:
+
+```bash
+uv run contexttrack schema > schemas/contexttrack-event-v1.schema.json
+uv run pytest -q tests/test_schema.py
+```
+
+Do not edit the snapshot by hand. The installed `contexttrack schema` command
+exports the same model-derived schema without needing this checkout. Model
+changes require schema review and regeneration; incompatible fields, kinds, or
+meanings require an explicitly supported format version. A package release does
+not by itself introduce a new schema version.
+
+JSON Schema alone does not supply the file reader's duplicate-key, UTF-8, BOM,
+and physical-line checks, or all Python strict-type checks. For example, JSON
+Schema's integer semantics can treat `1.0` as integral, while the public models
+reject it as `schema_version`. Use the documented readers and Pydantic adapter
+as the Python validation boundary, not the snapshot as a replacement reader.
+
+## Consumer handoff: separately authorized work
+
+The reference consumer is `conftamer-cli/node-query` at
+`a173121d6cec1ebf26394714c356a0eaa17149fa`. It has **not** been migrated to this
+package or to normalized files. It still parses raw captures itself and builds
+a message-only PMGraph. Its caller supplies `module_id`; it does not implement
+parameter ingestion, cross-module stitching, or full AppGraph composition.
+The [implementation plan, Section 7](docs/superpowers/plans/2026-09-27-contexttrack-normalized-events.md#7-separately-authorized-node-query-handoff)
+records the separately authorized migration and its test gate:
+
+1. Pin a tested ContextTrack artifact/version in the consumer's dependency
+   manifest and lockfile. Import the public models and `iter_raw_events`; do not
+   copy the schema/models or retain a second consumer-owned raw parser.
+2. Keep `load_contexttrack(path, *, module_id)` and
+   `conftamer build INPUT --module-id ID --output NEW` on **one completed raw
+   input path**. Do not add format auto-detection, an input-format option, a
+   second reader, or a required normalization pre-step. Support for normalized
+   consumer input is not part of this handoff.
+3. Adapt each `LocatedEvent` to the consumer's internal mutable association
+   record, retaining `record.location`, `event.context_key`, typed payload
+   fields, and canonical kind names. Public event models remain immutable.
+   Responses have no host field; association must not pretend one was captured.
+4. Keep the conservative association algorithm: a route or response needs a
+   unique earlier request with matching `(pid, context_id)`, method, and
+   concrete path. Rewritten/ambiguous routes warn and fall back to the concrete
+   path; unmatched/ambiguous responses warn and are omitted. API IDs never
+   become module IDs. Occurrence handling, label interning, and influence edges
+   remain consumer responsibilities.
+5. Explicitly document the stricter raw-input validation. Unknown kinds/keys,
+   per-kind forbidden message fields, explicit null string labels, non-null
+   `request_id` outside `Request sent`, `context.root_addr`, duplicate JSON
+   keys, and a UTF-8 BOM become errors rather than tolerated/warned-about input.
+   Malformed input surfaces as `EventFileError`, a `ValueError`, with
+   `path:physical-line`; the legacy `TypeError`/`ValueError` split disappears.
+   Expected CLI input errors still exit 2. Incomplete but well-typed evidence
+   remains available for downstream warnings/omissions.
+6. Verify the migrated consumer in an authorized disposable checkout using its
+   importer/CLI tests and a build of the committed raw fixture into a new
+   PMGraph file. Its expected four scrape nodes and edge `{("n1", "n2")}` are
+   graph results, **not** the normalizer's record count: normalization retains
+   all 20 fixture records, including eight received-response hooks.
+
+No consumer edits, registry publication, or adoption proof are implied by the
+producer's wheel and capture checks. The standard-library-only `analysis/`
+scripts also stay on raw input; their co-occurrence graphs are diagnostic views,
+not canonical PMGraphs or proofs of causality.
+
+## Privacy, trust boundaries, and human audit
+
+Normalized output can retain raw query strings, context diagnostics, endpoint
+labels, handler names, and source paths. These can disclose credentials or
+other sensitive/environment-specific information. This release is **not a
+redaction mechanism**. Keep the original capture for auditing, protect both
+files appropriately, and do not commit real captures or generated graphs.
+Valid JSONL, successful normalization, and even a nonempty capture do not prove
+capture completeness, successful HTTP delivery, or correct influence attribution.
+
+Python and Pydantic (including pydantic-core and typing dependencies), the Go
+toolchain/standard library that produces raw evidence, uv/uv_build, pytest, and
+type/lint/format/build tooling are external trust boundaries. Dependency
+manifests, lock metadata/hashes, and artifact checks are project review inputs;
+they are **not an audit of third-party source**. Filesystem publication relies
+on the local hard-link behavior described above. The paper defines the intended
+PMGraph/AppGraph design; producer and consumer tests cover only their stated
+prototype boundaries.
+
+The [Task 5 handoff](docs/contexttrack-normalized-events-task5.md) records exact
+commands/results, outstanding findings, and a complete-project file inventory.
+Human review must cover existing and new source, Go hooks/patches, tests,
+tooling, documentation (including the plan), generated schema, and packaging/
+lock metadata against the final revision or recorded file hashes. Every file's
+human review status and actual sign-off remain **pending** until humans perform
+that audit and resolve findings; automated checks and agent review cannot
+satisfy this gate.
