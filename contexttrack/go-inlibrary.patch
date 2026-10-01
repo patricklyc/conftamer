@@ -1,16 +1,8 @@
 diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/net/http/client.go
-index d6a8010..72c86ad 100644
+index d6a8010..b202d44 100644
 --- a/usr/local/go/src/net/http/client.go
 +++ b/home/tcr6/go-conftamer/src/net/http/client.go
-@@ -21,6 +21,7 @@ import (
- 	"net/url"
- 	"reflect"
- 	"slices"
-+	"strconv"
- 	"strings"
- 	"sync"
- 	"sync/atomic"
-@@ -607,6 +608,15 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+@@ -607,6 +607,15 @@ func (c *Client) do(req *Request) (retre
  	}
  	_ = *c // panic early if c is nil; see go.dev/issue/53521
  
@@ -26,7 +18,7 @@ index d6a8010..72c86ad 100644
  	var (
  		deadline      = c.deadline()
  		reqs          []*Request
-@@ -669,7 +679,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+@@ -669,7 +678,7 @@ func (c *Client) do(req *Request) (retre
  				Header:   make(Header),
  				Host:     host,
  				Cancel:   ireq.Cancel,
@@ -35,7 +27,7 @@ index d6a8010..72c86ad 100644
  			}
  			if includeBody && ireq.GetBody != nil {
  				req.Body, err = ireq.GetBody()
-@@ -728,9 +738,13 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+@@ -728,9 +737,13 @@ func (c *Client) do(req *Request) (retre
  		}
  
  		reqs = append(reqs, req)
@@ -50,28 +42,23 @@ index d6a8010..72c86ad 100644
  			// c.send() always closes req.Body
  			reqBodyClosed = true
  			if !deadline.IsZero() && didTimeout() {
-@@ -738,6 +752,16 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+@@ -738,6 +751,11 @@ func (c *Client) do(req *Request) (retre
  			}
  			return nil, uerr(err)
  		}
 +		// A RoundTripper other than Transport may return the private copy.
 +		conftamerRestoreRequest(resp)
 +
-+		// Label this redirect hop, not the original request. resp.Status only
-+		// restates resp.StatusCode and is not logged.
-+		conftamerLog("Response received", map[string]string{
-+			"resp.StatusCode": strconv.Itoa(resp.StatusCode),
-+			"req.Method":      valueOrDefault(req.Method, MethodGet),
-+			"req.URL.Path":    req.URL.Path,
-+		}, sendReq.Context(), nil, true, nil)
++		// Keep this hop's caller-visible labels and the stamped send context.
++		conftamerLogResponseReceived(req, resp, sendReq.Context())
  
  		var shouldRedirect, includeBodyOnHop bool
  		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, reqs[0])
 diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
-index c440e76..4de6adb 100644
+index c440e76..5259a6f 100644
 --- a/usr/local/go/src/net/http/h2_bundle.go
 +++ b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
-@@ -6314,6 +6314,7 @@ func (sc *http2serverConn) newWriterAndRequestNoBody(st *http2stream, rp httpcom
+@@ -6314,6 +6314,7 @@ func (sc *http2serverConn) newWriterAndR
  		Body:       body,
  		Trailer:    res.Trailer,
  	}).WithContext(st.ctx)
@@ -79,30 +66,24 @@ index c440e76..4de6adb 100644
  	rw := sc.newResponseWriter(st, req)
  	return rw, req, nil
  }
-@@ -6950,6 +6951,16 @@ func (rws *http2responseWriterState) writeHeader(code int) {
+@@ -6950,6 +6951,10 @@ func (rws *http2responseWriterState) wri
  
  	http2checkWriteHeaderCode(code)
  
 +	// Include implicit headers from writeChunk, but not ignored or invalid
-+	// WriteHeader calls. No caller identification: see conftamerLog.
-+	if conftamerOn() {
-+		conftamerLog("Response sent", map[string]string{
-+			"code":         strconv.Itoa(code),
-+			"req.Method":   rws.req.Method,
-+			"req.URL.Path": rws.req.URL.Path,
-+		}, rws.req.Context(), nil, false, nil)
-+	}
++	// WriteHeader calls.
++	conftamerLogResponseSent(rws.req, code)
 +
  	// Handle informational headers
  	if code >= 100 && code <= 199 {
  		// Per RFC 8297 we must not clear the current header map
-@@ -8636,6 +8647,9 @@ func (cc *http2ClientConn) roundTrip(req *Request, streamf func(*http2clientStre
+@@ -8636,6 +8641,9 @@ func (cc *http2ClientConn) roundTrip(req
  
  	handleResponseHeaders := func() (*Response, error) {
  		res := cs.res
 +		// Final headers arrived: log them even if waitDone fails below and
 +		// RoundTrip returns an error instead of this response.
-+		conftamerLogResponseWire("Response received", res.StatusCode, ctx, req)
++		conftamerLogResponseWire(res.StatusCode, ctx, req)
  		if res.StatusCode > 299 {
  			// On error or status code 3xx, 4xx, 5xx, etc abort any
  			// ongoing write, assuming that the server doesn't care
@@ -121,10 +102,10 @@ index 167cff5..817b5a7 100644
  
  // Context returns the request's context. To change the context, use
 diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/net/http/server.go
-index 6a60d94..7432a8d 100644
+index 6a60d94..ae593dc 100644
 --- a/usr/local/go/src/net/http/server.go
 +++ b/home/tcr6/go-conftamer/src/net/http/server.go
-@@ -1031,7 +1031,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+@@ -1031,7 +1031,7 @@ func (c *conn) readRequest(ctx context.C
  	delete(req.Header, "Host")
  
  	ctx, cancelCtx := context.WithCancel(ctx)
@@ -133,21 +114,16 @@ index 6a60d94..7432a8d 100644
  	req.RemoteAddr = c.remoteAddr
  	req.TLS = c.tlsState
  	if body, ok := req.Body.(*body); ok {
-@@ -1149,6 +1149,13 @@ func (w *response) WriteHeader(code int) {
+@@ -1149,6 +1149,8 @@ func (w *response) WriteHeader(code int)
  	}
  	checkWriteHeaderCode(code)
  
-+	// No caller identification: see conftamerLog.
-+	conftamerLog("Response sent", map[string]string{
-+		"code":         strconv.Itoa(code),
-+		"req.Method":   w.req.Method,
-+		"req.URL.Path": w.req.URL.Path,
-+	}, w.req.Context(), nil, false, nil)
++	conftamerLogResponseSent(w.req, code)
 +
  	if code < 101 || code > 199 {
  		// Sending a 100 Continue or any non-1xx header disables the
  		// automatically-sent 100 Continue from Request.Body.Read.
-@@ -2819,9 +2826,12 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+@@ -2819,9 +2821,12 @@ func (mux *ServeMux) ServeHTTP(w Respons
  	}
  	var h Handler
  	if use121 {
@@ -161,24 +137,20 @@ index 6a60d94..7432a8d 100644
  	}
  	h.ServeHTTP(w, r)
  }
-@@ -3306,6 +3316,12 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+@@ -3306,6 +3311,8 @@ func (sh serverHandler) ServeHTTP(rw Res
  		handler = globalOptionsHandler{}
  	}
  
-+	conftamerLog("Request received", map[string]string{
-+		"req.Method":       req.Method,
-+		"req.URL.Path":     req.URL.Path,
-+		"req.URL.RawQuery": req.URL.RawQuery,
-+	}, req.Context(), nil, true, handler)
++	conftamerLogRequestReceived(req, handler)
 +
  	handler.ServeHTTP(rw, req)
  }
  
 diff --git a/usr/local/go/src/net/http/transport.go b/home/tcr6/go-conftamer/src/net/http/transport.go
-index 26a25d2..0fccd1b 100644
+index 26a25d2..a774d9e 100644
 --- a/usr/local/go/src/net/http/transport.go
 +++ b/home/tcr6/go-conftamer/src/net/http/transport.go
-@@ -617,10 +617,27 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
+@@ -617,10 +617,21 @@ func (t *Transport) roundTrip(req *Reque
  	}
  
  	origReq := req
@@ -189,13 +161,7 @@ index 26a25d2..0fccd1b 100644
 +		req = conftamerStampRequest(req)
 +		origReq = conftamerOriginal(req)
 +		if !t.conftamerWillReject(req, isHTTP) {
-+			method := valueOrDefault(req.Method, MethodGet)
-+			conftamerLog("Request sent", map[string]string{
-+				"req.Method":       method,
-+				"req.URL.Host":     req.URL.Host,
-+				"req.URL.Path":     req.URL.Path,
-+				"req.URL.RawQuery": req.URL.RawQuery,
-+			}, req.Context(), &conftamerRequestID{Method: method, Host: req.URL.Host, Path: req.URL.Path}, true, nil)
++			conftamerLogRequestSent(req)
 +		}
 +	}
  	req = setupRewindBody(req)
@@ -206,11 +172,11 @@ index 26a25d2..0fccd1b 100644
  			return resp, err
  		}
  		var err error
-@@ -2519,6 +2536,7 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
+@@ -2519,6 +2530,7 @@ func (pc *persistConn) readResponse(rc r
  		if err != nil {
  			return
  		}
-+		conftamerLogResponseWire("Response received", resp.StatusCode, nil, rc.treq.Request)
++		conftamerLogResponseWire(resp.StatusCode, nil, rc.treq.Request)
  		resCode := resp.StatusCode
  		if continueCh != nil && resCode == StatusContinue {
  			if trace != nil && trace.Got100Continue != nil {

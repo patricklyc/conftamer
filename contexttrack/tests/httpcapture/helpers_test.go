@@ -12,12 +12,20 @@ import (
 )
 
 type event struct {
-	Kind    string            `json:"kind"`
-	PID     int               `json:"pid"`
-	Message map[string]string `json:"message"`
-	Context struct {
-		ID    string `json:"context_id"`
-		Error string `json:"error"`
+	Kind        string            `json:"kind"`
+	PID         int               `json:"pid"`
+	GoroutineID int               `json:"goroutine_id"`
+	ThreadID    int               `json:"thread_id"`
+	File        string            `json:"file"`
+	Line        int               `json:"line"`
+	ApiId       string            `json:"api_id"`
+	Handler     string            `json:"handler"`
+	Message     map[string]string `json:"message"`
+	Context     struct {
+		ID     string `json:"context_id"`
+		Source string `json:"source"`
+		Type   string `json:"type"`
+		Error  string `json:"error"`
 	} `json:"context"`
 	RequestID struct {
 		Method string `json:"method"`

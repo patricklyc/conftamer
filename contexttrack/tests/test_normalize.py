@@ -32,11 +32,12 @@ raw_forbidden = [
 RAW_KINDS = tuple(RAW_FIELDS)
 
 RESPONSE_STATUSES = (
-    ("Response sent", "code"),
-    ("Response received", "resp.StatusCode"),
+    pytest.param("Response sent", "code", id="send-response"),
+    pytest.param("Response received", "resp.StatusCode", id="receive-response"),
 )
 
 
+# Label mapping and incomplete evidence.
 def test_outbound_label_precedence_and_no_input_mutation(raw_sent):
     raw_sent["message"]["req.Method"] = "POST"
     raw_sent["message"]["req.URL.Host"] = "other.example"
@@ -95,40 +96,45 @@ def test_response_is_normalized_without_association():
 @pytest.mark.parametrize(
     "raw_kind, kind, event_type, raw_fields, normalized_fields",
     [
-        (
+        pytest.param(
             "Request sent",
             "send_request",
             RequestSent,
             {"req.URL.Host": "Höst:80", "req.URL.RawQuery": "q=é"},
             {"host": "Höst:80", "raw_query": "q=é"},
+            id="send-request",
         ),
-        (
+        pytest.param(
             "Request received",
             "receive_request",
             RequestReceived,
             {"req.URL.RawQuery": "q=é"},
             {"raw_query": "q=é"},
+            id="receive-request",
         ),
-        (
+        pytest.param(
             "Request routed",
             "request_routed",
             RequestRouted,
             {"pattern": "GET /{name}"},
             {"pattern": "GET /{name}"},
+            id="request-routed",
         ),
-        (
+        pytest.param(
             "Response sent",
             "send_response",
             ResponseSent,
             {"code": "0200"},
             {"status_code": 200},
+            id="send-response",
         ),
-        (
+        pytest.param(
             "Response received",
             "receive_response",
             ResponseReceived,
             {"resp.StatusCode": "999"},
             {"status_code": 999},
+            id="receive-response",
         ),
     ],
 )
@@ -178,10 +184,14 @@ def test_incomplete_message_is_retained_without_warnings(kind, recwarn, capsys):
 @pytest.mark.parametrize(
     "request_id, labels",
     [
-        (None, (None, None, None)),
-        ({}, (None, None, None)),
-        ({"host": "Höst:80"}, (None, "Höst:80", None)),
-        ({"method": "", "host": "", "path": ""}, ("", "", "/")),
+        pytest.param(None, (None, None, None), id="null-label"),
+        pytest.param({}, (None, None, None), id="empty-label"),
+        pytest.param({"host": "Höst:80"}, (None, "Höst:80", None), id="host-only"),
+        pytest.param(
+            {"method": "", "host": "", "path": ""},
+            ("", "", "/"),
+            id="explicit-empty-strings",
+        ),
     ],
 )
 def test_null_empty_or_partial_request_id_never_falls_back(
@@ -220,6 +230,7 @@ def test_absent_context_identity_never_creates_a_shared_group(raw_sent, context)
     assert event.context_key is None
 
 
+# Raw shape, field types, and per-kind restrictions.
 @pytest.mark.parametrize("field", ["kind", "pid", "message"])
 def test_required_raw_fields_cannot_be_omitted(raw_sent, field):
     del raw_sent[field]
@@ -290,17 +301,18 @@ def test_message_fields_are_limited_to_the_event_kind(kind, field):
         normalize_record({"kind": kind, "pid": 42, "message": {field: "200"}})
 
 
+# Status conversion accepts decimal evidence, not just the HTTP status range.
 @pytest.mark.parametrize("kind, field", RESPONSE_STATUSES)
 @pytest.mark.parametrize(
     "status, expected",
     [
-        ("0", 0),
-        ("000", 0),
-        ("103", 103),
-        ("0200", 200),
-        ("999", 999),
-        ("1000", 1000),
-        ("٢٠٠", 200),
+        pytest.param("0", 0, id="zero"),
+        pytest.param("000", 0, id="zero-padded-zero"),
+        pytest.param("103", 103, id="informational"),
+        pytest.param("0200", 200, id="zero-padded-success"),
+        pytest.param("999", 999, id="above-http-range"),
+        pytest.param("1000", 1000, id="four-digits"),
+        pytest.param("٢٠٠", 200, id="unicode-decimal"),
     ],
 )
 def test_decimal_status_strings_are_converted_without_http_range_limits(
@@ -338,8 +350,15 @@ def test_non_decimal_status_strings_are_rejected(kind, field, status):
         normalize_record({"kind": kind, "pid": 42, "message": {field: status}})
 
 
+# Other formats are not raw input; accepted strings retain their spelling.
 @pytest.mark.parametrize(
-    "context", [{"root_addr": "0x1234"}, {"context_id": "id:7", "root_addr": "0x1234"}]
+    "context",
+    [
+        pytest.param({"root_addr": "0x1234"}, id="historical-root"),
+        pytest.param(
+            {"context_id": "id:7", "root_addr": "0x1234"}, id="mixed-root-and-id"
+        ),
+    ],
 )
 def test_historical_context_root_addresses_are_rejected(raw_sent, context):
     with pytest.raises(ValidationError, match="root_addr"):

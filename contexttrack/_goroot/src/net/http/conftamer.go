@@ -95,9 +95,9 @@ type conftamerContextInfo struct {
 
 // Context ID (correlation key).
 //
-// An explicit, process-local, monotonically-increasing request ID stamped
+// An explicit, process-local, monotonically-increasing context ID stamped
 // into the request context at its origin and inherited by every derived context.
-// conftamerIDKey is the context.Value key for the stamped request ID.
+// conftamerIDKey is the context.Value key for the stamped context ID.
 // It's unexported to avoid colliding with other context.Value keys.
 type conftamerIDKeyType struct{}
 
@@ -124,18 +124,11 @@ func conftamerStampID(ctx context.Context) context.Context {
 	return context.WithValue(ctx, conftamerIDKey, conftamerNextID.Add(1))
 }
 
-// Private outbound request copies.
-//
-// An outbound request whose context lacks an ID is sent as a private copy with
-// a stamped context: stamping the caller's request in place would race with
-// its readers. Go exposes and cancels outbound requests by pointer
-// (Response.Request, CheckRedirect's via, Transport.CancelRequest), so the copy
-// records the caller's request and Go keeps using that one.
-
-// conftamerOrigin links a private copy to the request it was made from. Copies
-// of the copy (Go's own, or an application's) inherit it, but are not the copy.
+// Requests without IDs use private stamped copies to avoid caller-reader races.
+// Keep the original pointer for Response.Request, redirects, and cancellation;
+// Go's or an application's copies of the stamped copy retain their own identity.
 type conftamerOrigin struct {
-	copy, orig *Request
+	stampedCopy, originalRequest *Request
 }
 
 // conftamerStampRequest returns r if its context already carries an ID, else a
@@ -145,16 +138,16 @@ func conftamerStampRequest(r *Request) *Request {
 	if conftamerHasID(ctx) {
 		return r
 	}
-	r2 := r.WithContext(conftamerStampID(ctx))
-	r2.conftamer = &conftamerOrigin{copy: r2, orig: r}
-	return r2
+	stampedCopy := r.WithContext(conftamerStampID(ctx))
+	stampedCopy.conftamer = &conftamerOrigin{stampedCopy: stampedCopy, originalRequest: r}
+	return stampedCopy
 }
 
 // conftamerOriginal returns the request r was copied from if r is a private
 // copy made by conftamerStampRequest, else r.
 func conftamerOriginal(r *Request) *Request {
-	if r != nil && r.conftamer != nil && r.conftamer.copy == r {
-		return r.conftamer.orig
+	if r != nil && r.conftamer != nil && r.conftamer.stampedCopy == r {
+		return r.conftamer.originalRequest
 	}
 	return r
 }
@@ -312,61 +305,95 @@ func conftamerGoID() int {
 	return 0
 }
 
-// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
-// reqID (may be nil) is set for "Request sent". withCaller enables caller identification.
-// handler (non-nil only for "Request received") is the not-yet-invoked Handler about to
-// serve the request — when set, it's used instead of a stack walk, since the application
-// handler isn't on the stack yet at that log point, and its name is recorded as Handler.
-//
-// "Response sent" deliberately does NOT identify a caller: at the point a response is
-// written, the stack holds whatever the handler last called (fmt.Fprintln,
-// gzip.(*Writer).Write), not the handler itself, so the walk yields a misleading API.
-// Responses record only their code plus the method/path of the request they answer;
-// analysis (contexttrack/analysis/message_graph.py) recovers api_id/handler by matching
-// each response back to the "Request received" it answers, and the matched route pattern
-// from the "Request routed" events logged by conftamerLogRouted.
-func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
+// Helpers build payloads; the logger fills the envelope and writes JSONL.
+// Preserve provenance: direct hooks name their stock Go file; route/wire hooks
+// name conftamer.go. With overlays, line numbers refer to the patched source.
+const (
+	conftamerHookSource   = 2 // caller of the event-specific helper
+	conftamerHelperSource = 1 // the event-specific helper itself
+)
+
+func conftamerLog(ev conftamerEvent, ctx context.Context, sourceDepth int) {
 	if !conftamerOn() {
 		return
 	}
+	_, ev.File, ev.Line, _ = runtime.Caller(sourceDepth)
+	ev.Pid = os.Getpid()
+	ev.GoroutineID = conftamerGoID()
+	ev.Context = conftamerContext(ctx)
 
-	_, file, line, _ := runtime.Caller(1)
-
-	ev := conftamerEvent{
-		Kind:        kind,
-		Pid:         os.Getpid(),
-		GoroutineID: conftamerGoID(),
-		File:        file,
-		Line:        line,
-		Message:     msg,
-		Context:     conftamerContext(ctx),
-	}
-
-	if withCaller {
-		var c *conftamerCaller
-		if handler != nil {
-			c = conftamerHandlerCaller(handler)
-		} else {
-			c = conftamerFindCaller()
-		}
-		if c != nil {
-			ev.ApiId = c.ApiId
-			if kind == "Request received" {
-				ev.Handler = c.FuncName
-			}
-		}
-	}
-	if kind == "Request sent" {
-		ev.RequestID = reqID
-	}
-
-	linebytes, err := json.Marshal(ev)
+	lineBytes, err := json.Marshal(ev)
 	if err != nil {
 		return
 	}
 	conftamerMu.Lock()
-	conftamerFile.Write(append(linebytes, '\n'))
+	conftamerFile.Write(append(lineBytes, '\n'))
 	conftamerMu.Unlock()
+}
+
+func conftamerRequestEvent(kind string, req *Request) conftamerEvent {
+	return conftamerEvent{Kind: kind, Message: map[string]string{
+		"req.Method": req.Method, "req.URL.Path": req.URL.Path,
+	}}
+}
+
+func conftamerLogRequestSent(req *Request) {
+	if !conftamerOn() {
+		return
+	}
+	ev := conftamerRequestEvent("Request sent", req)
+	method := valueOrDefault(req.Method, MethodGet)
+	ev.Message["req.Method"] = method
+	ev.Message["req.URL.Host"] = req.URL.Host
+	ev.Message["req.URL.RawQuery"] = req.URL.RawQuery
+	ev.RequestID = &conftamerRequestID{Method: method, Host: req.URL.Host, Path: req.URL.Path}
+	if caller := conftamerFindCaller(); caller != nil {
+		ev.ApiId = caller.ApiId
+	}
+	conftamerLog(ev, req.Context(), conftamerHookSource)
+}
+
+// The handler has not run yet, so identify it from its value, not the stack.
+func conftamerLogRequestReceived(req *Request, handler Handler) {
+	if !conftamerOn() {
+		return
+	}
+	ev := conftamerRequestEvent("Request received", req)
+	ev.Message["req.URL.RawQuery"] = req.URL.RawQuery
+	caller := conftamerHandlerCaller(handler)
+	if handler == nil {
+		caller = conftamerFindCaller()
+	}
+	if caller != nil {
+		ev.ApiId = caller.ApiId
+		ev.Handler = caller.FuncName
+	}
+	conftamerLog(ev, req.Context(), conftamerHookSource)
+}
+
+// Do not identify a caller here: fmt/gzip/etc. can obscure the handler on the
+// stack. Consumers may associate this response with its received request.
+func conftamerLogResponseSent(req *Request, code int) {
+	if !conftamerOn() {
+		return
+	}
+	ev := conftamerRequestEvent("Response sent", req)
+	ev.Message["code"] = strconv.Itoa(code)
+	conftamerLog(ev, req.Context(), conftamerHookSource)
+}
+
+// Client.do reports the caller's hop labels and the stamped send context.
+func conftamerLogResponseReceived(req *Request, resp *Response, ctx context.Context) {
+	if !conftamerOn() {
+		return
+	}
+	ev := conftamerRequestEvent("Response received", req)
+	ev.Message["req.Method"] = valueOrDefault(req.Method, MethodGet)
+	ev.Message["resp.StatusCode"] = strconv.Itoa(resp.StatusCode)
+	if caller := conftamerFindCaller(); caller != nil {
+		ev.ApiId = caller.ApiId
+	}
+	conftamerLog(ev, ctx, conftamerHookSource)
 }
 
 // conftamerWillReject reports whether Transport.roundTrip will reject req without
@@ -378,28 +405,20 @@ func (t *Transport) conftamerWillReject(req *Request, isHTTP bool) bool {
 		(!isHTTP || req.Method != "" && !validMethod(req.Method) || req.URL.Host == "")
 }
 
-// conftamerLogRouted records the route pattern a ServeMux matched for r, logged from
-// ServeMux.ServeHTTP because that's the only point the pattern is reliably in hand:
-// "Request received" fires before any routing happens, and by "Response sent" a nested
-// mux's pattern has been written to a shallow request copy (see StripPrefix) that the
-// ResponseWriter's request never sees. Nested muxes each log, sharing the request's
-// context ID, so the last one recorded is the innermost — the most specific match.
-// An empty pattern (no route matched) is not logged.
+// Record patterns during routing: receipt is too early, and nested muxes may
+// later put patterns on copies the ResponseWriter never sees (e.g. StripPrefix).
+// Multiple observations can share a context; consumers decide associations.
 func conftamerLogRouted(pattern string, r *Request) {
-	if pattern == "" {
+	if pattern == "" || !conftamerOn() {
 		return
 	}
-	conftamerLog("Request routed", map[string]string{
-		"pattern":      pattern,
-		"req.Method":   r.Method,
-		"req.URL.Path": r.URL.Path,
-	}, r.Context(), nil, false, nil)
+	ev := conftamerRequestEvent("Request routed", r)
+	ev.Message["pattern"] = pattern
+	conftamerLog(ev, r.Context(), conftamerHelperSource)
 }
 
-// ConftamerLogRouted records a route pattern matched by a router outside this
-// package — see conftamerLogRouted. Exported because a router such as
-// prometheus/common/route does its own matching, and can reach neither the
-// unexported logger nor the context ID it correlates on.
+// ConftamerLogRouted lets external routers report matches with the same context
+// correlation as ServeMux, without access to the private logger or context key.
 func ConftamerLogRouted(pattern string, r *Request) {
 	conftamerLogRouted(pattern, r)
 }
@@ -409,15 +428,11 @@ func ConftamerLogRouted(pattern string, r *Request) {
 // No caller ID: the HTTP/1 read loop has no application caller on its stack.
 // Consumers can attribute either protocol's response to its request.
 // r may be nil when request metadata is unavailable.
-func conftamerLogResponseWire(kind string, code int, ctx context.Context, r *Request) {
+func conftamerLogResponseWire(code int, ctx context.Context, r *Request) {
 	if !conftamerOn() {
 		return
 	}
-	codeKey := "code"
-	if kind == "Response received" {
-		codeKey = "resp.StatusCode"
-	}
-	msg := map[string]string{codeKey: strconv.Itoa(code)}
+	msg := map[string]string{"resp.StatusCode": strconv.Itoa(code)}
 	if r != nil {
 		msg["req.Method"] = valueOrDefault(r.Method, MethodGet)
 		if r.URL != nil {
@@ -427,5 +442,5 @@ func conftamerLogResponseWire(kind string, code int, ctx context.Context, r *Req
 			ctx = r.Context()
 		}
 	}
-	conftamerLog(kind, msg, ctx, nil, false, nil)
+	conftamerLog(conftamerEvent{Kind: "Response received", Message: msg}, ctx, conftamerHelperSource)
 }

@@ -5,14 +5,6 @@ from contexttrack.models import EVENT_ADAPTER, Event
 
 __all__ = ["normalize_record"]
 
-_KINDS = {
-    "Request sent": "send_request",
-    "Request received": "receive_request",
-    "Request routed": "request_routed",
-    "Response sent": "send_response",
-    "Response received": "receive_response",
-}
-
 
 def _path(value: str | None) -> str | None:
     return "/" if value == "" else value
@@ -34,30 +26,32 @@ def normalize_record(record: object) -> Event:
     """
     raw = RawEvent.model_validate(record)
     message = raw.message
-    normalized_message: dict[str, object]
-    if raw.kind == "Request sent":
-        label = raw.request_id or RawRequestID()
-        normalized_message = {
-            "method": label.method,
-            "host": label.host,
-            "path": _path(label.path),
-            "raw_query": message.raw_query,
-        }
-    else:
-        normalized_message = {"method": message.method, "path": _path(message.path)}
-        if raw.kind == "Request received":
+    # Outbound endpoint labels come only from request_id, never from message.
+    labels = raw.request_id or RawRequestID() if raw.kind == "Request sent" else message
+    normalized_message: dict[str, object] = {
+        "method": labels.method,
+        "path": _path(labels.path),
+    }
+    match raw.kind:
+        case "Request sent":
+            kind = "send_request"
+            normalized_message.update(host=labels.host, raw_query=message.raw_query)
+        case "Request received":
+            kind = "receive_request"
             normalized_message["raw_query"] = message.raw_query
-        elif raw.kind == "Request routed":
+        case "Request routed":
+            kind = "request_routed"
             normalized_message["pattern"] = message.pattern
-        else:
-            status = (
-                message.code if raw.kind == "Response sent" else message.status_code
-            )
-            normalized_message["status_code"] = _status(status)
+        case "Response sent":
+            kind = "send_response"
+            normalized_message["status_code"] = _status(message.code)
+        case "Response received":
+            kind = "receive_response"
+            normalized_message["status_code"] = _status(message.status_code)
     payload = raw.model_dump(exclude={"kind", "message", "context", "request_id"})
     payload.update(
         schema_version=1,
-        kind=_KINDS[raw.kind],
+        kind=kind,
         context=(raw.context or RawContext()).model_dump(),
         message=normalized_message,
     )

@@ -18,6 +18,31 @@ become usable downstream nodes. Consumer migration is separately authorized
 [below](#consumer-handoff-separately-authorized-work); `analysis/` and the current
 `conftamer-cli/node-query` importer still take raw captures only.
 
+## Walkthrough: one received request
+
+`normalize_record` validates a raw dict and returns a typed `RequestReceived`:
+
+```json
+{
+  "kind": "Request received", "pid": 42,
+  "context": {"context_id": "id:7"},
+  "message": {"req.Method": "GET", "req.URL.Path": "/items/7", "req.URL.RawQuery": "page=1"}
+}
+```
+
+`write_events` serializes it with unchanged labels and explicit nulls for missing
+evidence. These synthetic examples are formatted for reading; JSONL uses one line:
+
+```json
+{
+  "schema_version": 1, "kind": "receive_request", "pid": 42,
+  "context": {"context_id": "id:7", "source": null, "type": null, "error": null},
+  "api_id": null, "handler": null, "goroutine_id": null, "thread_id": null,
+  "file": null, "line": null,
+  "message": {"method": "GET", "path": "/items/7", "raw_query": "page=1"}
+}
+```
+
 ## Envelope and context
 
 [`models.py`](src/contexttrack/models.py) defines each event as a JSON object:
@@ -282,19 +307,8 @@ text = event.model_dump_json(by_alias=False, exclude_none=False, ensure_ascii=Fa
 assert EVENT_ADAPTER.validate_json(text) == event
 ```
 
-Raw conversion needs neither graph code nor other records:
-
-```python
-from contexttrack import ResponseReceived, normalize_record
-
-event = normalize_record({
-    "kind": "Response received", "pid": 42, "message": {"resp.StatusCode": "0200"},
-})
-assert isinstance(event, ResponseReceived)
-assert event.message.status_code == 200
-assert event.message.path is None and event.api_id is None
-assert event.context_key is None
-```
+For raw dicts, use `normalize_record(record)` as in the
+[walkthrough](#walkthrough-one-received-request); it needs no other records.
 
 File use (provide a completed raw input and a new output):
 

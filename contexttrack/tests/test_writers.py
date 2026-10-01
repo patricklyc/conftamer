@@ -13,12 +13,17 @@ from contexttrack.io import EventFileError, normalize_file, write_events
 from contexttrack.models import ContextInfo, RequestSent, SentRequestMessage
 
 
+# Invalid input and empty captures.
 @pytest.mark.parametrize(
     "bad_line, cause_type",
     [
-        (b"{", json.JSONDecodeError),
-        (b"\xff", UnicodeDecodeError),
-        (b'{"kind":"Request routed","pid":true,"message":{}}', ValidationError),
+        pytest.param(b"{", json.JSONDecodeError, id="malformed-json"),
+        pytest.param(b"\xff", UnicodeDecodeError, id="invalid-utf8"),
+        pytest.param(
+            b'{"kind":"Request routed","pid":true,"message":{}}',
+            ValidationError,
+            id="invalid-raw-type",
+        ),
     ],
 )
 def test_late_record_failure_does_not_publish_prefix(
@@ -38,7 +43,10 @@ def test_late_record_failure_does_not_publish_prefix(
     assert sorted(path.name for path in tmp_path.iterdir()) == [source.name]
 
 
-@pytest.mark.parametrize("text", ["", "\n \t\r\n\n"])
+@pytest.mark.parametrize(
+    "text",
+    [pytest.param("", id="empty"), pytest.param("\n \t\r\n\n", id="blank-only")],
+)
 def test_empty_normalization_publishes_empty_file(tmp_path, text):
     source, output = tmp_path / "raw.jsonl", tmp_path / "normalized.jsonl"
     source.write_text(text, encoding="utf-8")
@@ -50,6 +58,7 @@ def test_empty_normalization_publishes_empty_file(tmp_path, text):
     ]
 
 
+# Destination safety and cleanup before publication.
 def test_never_overwrite_existing_file(tmp_path, write_jsonl, raw_sent):
     source = write_jsonl(raw_sent)
     output = tmp_path / "normalized.jsonl"
@@ -100,6 +109,7 @@ def test_missing_input_cleans_up_writer_temporary_file(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+# Write failures and concurrent publication must never expose a partial file.
 @pytest.mark.parametrize("failure_stage", ["write", "close"])
 def test_write_or_close_failure_never_publishes_output(
     tmp_path, event, monkeypatch, failure_stage
@@ -173,6 +183,7 @@ def test_unsupported_hard_links_do_not_fall_back_to_overwriting(
     assert list(tmp_path.iterdir()) == []
 
 
+# Revalidation, canonical serialization, and streaming iterator failures.
 @pytest.mark.parametrize("invalid_part", ["envelope", "context", "message"])
 def test_writer_revalidates_constructed_models_before_reading_next_value(
     tmp_path, event, invalid_part

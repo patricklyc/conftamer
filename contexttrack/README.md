@@ -16,6 +16,28 @@ possible influence, not exact per-request causality; API attribution and capture
 coverage are best-effort. Parameter discovery, cross-module stitching,
 distributed tracing, redaction, and consumer migration are outside this package.
 
+## Developer orientation
+
+```text
+Capture:   Go hook → conftamerLog → raw JSONL
+Normalize: completed raw capture → normalize_record → typed event → write_events
+```
+
+| Start here | Responsibility |
+| --- | --- |
+| `go-inlibrary.patch` | Places hooks in stock Go's HTTP client, server, and transports |
+| `_goroot/src/net/http/conftamer.go` | Implements those hooks and writes raw events |
+| `scripts/setup-go.sh`, `bin/ctgo` | Prepare the overlay/clone and run instrumented Go |
+| `src/contexttrack/_raw.py` | Validates raw fields, including the dotted message keys |
+| `src/contexttrack/normalize.py`, `src/contexttrack/models.py` | Convert one record and define normalized event types |
+| `src/contexttrack/io.py`, `src/contexttrack/cli.py` | Read/write JSONL safely and expose the commands |
+| `tests/httpcapture/`, `tests/test_*.py` | Exercise producer behavior, tooling, and the Python package |
+
+Three similarly named labels have different jobs: `(pid, context_id)` groups
+possible influence within one capture, `request_id` labels an outbound endpoint,
+and `api_id` is best-effort API attribution. None is a distributed trace ID or a
+PMGraph module ID. See the [raw-to-normalized walkthrough](OUTPUT.md#walkthrough-one-received-request).
+
 ## Capture quick start: ctgo
 
 Requires a **stock Go 1.26.6** (`go` or `$CONFTAMER_GO`); tested on Linux/amd64.
@@ -112,10 +134,10 @@ See [streaming I/O](OUTPUT.md#streaming-jsonl-io) for rollback/publication guara
 and [public API](OUTPUT.md#public-python-api) for in-memory raw reading.
 
 **`analysis/` and `conftamer-cli/node-query` still require raw captures.** Do not
-pass normalized files to them. Normalization retains incomplete observations
-and repeated hooks without association, route reconstruction, or graph building.
-It is not redaction or a completeness check; even an empty capture normalizes
-successfully. Protect raw and normalized query/source-path data as described in
+pass normalized files to them. For conversion rules and incomplete/repeated
+observations, see [raw mapping](OUTPUT.md#raw-mapping-and-strictness-differences).
+Even an empty capture normalizes successfully; success is not a completeness
+check. Protect both files as described in
 [privacy and audit limits](OUTPUT.md#privacy-trust-boundaries-and-human-audit).
 
 ## Tests and generated schema
@@ -161,13 +183,10 @@ python3 -m unittest tests/test_tooling.py -v  # CONTEXTTRACK_TEST_CLONE=1 enable
   -run 'TestRoundTripCapture|TestRedirectLabels|TestInheritedContext' ./...)
 ```
 
-The standalone loopback module has no external dependencies; `-race` needs a
-supported platform/C compiler. It tests HTTP/1 and bundled HTTP/2, client/direct
-transport and empty-method paths, redirect labels/inheritance, implicit/ignored/
-invalid HTTP/2 headers, unstamped contexts, body rewind/reuse, ownership races,
-`Client.Timeout` redirects, warm HTTP/2 connections, caller-visible request and
-redirect-history identity, native/application copies, `Transport.CancelRequest`,
-legacy `Request.Cancel`, rejected sends, and a tracing-disabled subprocess.
+The [loopback suite](tests/httpcapture/) has no external dependencies; `-race`
+needs a supported platform/C compiler. It covers HTTP/1 and bundled HTTP/2,
+client/direct transport, headers and labels, routing/redirect contexts,
+body rewind/reuse, ownership/identity/cancellation, metadata, and tracing off.
 The full capture intentionally includes negative unstamped routing evidence
 that downstream importers may warn about; the filtered command avoids those
 negative, ownership, and cancellation cases.
@@ -190,13 +209,12 @@ Automated success is not complete-project human audit/sign-off; see OUTPUT.
 
 ### Instrumented request and hook boundaries
 
-Monotonic IDs are stamped at HTTP origins and inherited by redirects and derived
-contexts. Group only by **`(pid, context_id)` within one capture** (see
-[context identity](OUTPUT.md#context-identity)). Unstamped contexts logged elsewhere
-report `context.error`, not a fabricated per-event ID. The historical
-[`go-inlibrary-optional.patch`](go-inlibrary-optional.patch) walks parent contexts
-to heap roots; it is not the current format, suffers address reuse/custom-type
-risks, and cannot be combined with ID-based analysis or cross-run correlation.
+IDs are stamped at HTTP origins and inherited by redirects and derived contexts;
+[context identity](OUTPUT.md#context-identity) specifies their grouping rules.
+Unstamped contexts logged elsewhere report `context.error`, not a fabricated
+per-event ID. The historical [`go-inlibrary-optional.patch`](go-inlibrary-optional.patch)
+walks heap roots; it is not the current format, risks address reuse/custom-type
+errors, and cannot be combined with ID-based analysis or cross-run correlation.
 
 The caller's request is never stamped in place. Only an outbound request missing
 an ID gets a private stamped copy; inherited-ID requests are not copied again.

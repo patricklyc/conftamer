@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,26 +32,58 @@ func TestRoundTripCapture(t *testing.T) {
 		{"http2/client/empty-method", true, false, ""},
 		{"http2/transport/get", true, true, "GET"},
 		{"http2/transport/empty-method", true, true, ""},
+		{"http1/client/post", false, false, "POST"},
+		{"http1/transport/post", false, true, "POST"},
+		{"http2/client/post", true, false, "POST"},
+		{"http2/transport/post", true, true, "POST"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := "/capture/" + tc.name
 			s := server(t, tc.h2, path, func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(204)
 			})
-			request(t, s, tc.method, path, tc.direct)
+			const query = "page=1&label=%C3%A9"
+			request(t, s, tc.method, path+"?"+query, tc.direct)
+			method := tc.method
+			if method == "" {
+				method = "GET"
+			}
+			host := strings.TrimPrefix(strings.TrimPrefix(s.URL, "https://"), "http://")
 			sent := onlyEvent(t, path, "Request sent")
-			if sent.RequestID.Method != "GET" || sent.Message["req.Method"] != "GET" ||
-				sent.RequestID.Path != path || sent.RequestID.Host != strings.TrimPrefix(strings.TrimPrefix(s.URL, "https://"), "http://") {
+			if sent.RequestID.Method != method || sent.Message["req.Method"] != method ||
+				sent.RequestID.Path != path || sent.RequestID.Host != host {
 				t.Errorf("incorrect outbound label: %+v", sent)
 			}
 			if sent.Context.ID == "" {
 				t.Fatal("outbound request has no context ID")
 			}
 			// Client and wire hooks may both report the same response.
-			assertResponses(t, path, "GET", "204", sent.Context.ID)
+			assertResponses(t, path, method, "204", sent.Context.ID)
 			received := onlyEvent(t, path, "Request received")
 			routed := onlyEvent(t, path, "Request routed")
 			reply := onlyEvent(t, path, "Response sent")
+			replySource := "server.go"
+			if tc.h2 {
+				replySource = "h2_bundle.go"
+			}
+			for _, want := range []struct {
+				e             event
+				source, apiID string
+				extra         map[string]string
+			}{
+				{sent, "transport.go", captureAPI, map[string]string{"req.URL.Host": host, "req.URL.RawQuery": query}},
+				{received, "server.go", "", map[string]string{"req.URL.RawQuery": query}},
+				{routed, "conftamer.go", "", map[string]string{"pattern": path}},
+				{reply, replySource, "", map[string]string{"code": "204"}},
+			} {
+				assertMetadata(t, want.e, want.source, want.apiID, "")
+				message := map[string]string{"req.Method": method, "req.URL.Path": path}
+				maps.Copy(message, want.extra)
+				if !maps.Equal(want.e.Message, message) {
+					t.Errorf("%s payload = %v, want %v", want.e.Kind, want.e.Message, message)
+				}
+			}
+			assertResponseMetadata(t, path, tc.direct)
 			if received.Context.ID == "" || received.Context.ID == sent.Context.ID ||
 				routed.Context.ID != received.Context.ID || reply.Context.ID != received.Context.ID ||
 				routed.Message["pattern"] != path || reply.Message["code"] != "204" {
