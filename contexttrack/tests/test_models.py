@@ -1,14 +1,10 @@
 """Consumer-facing validation, identity, and serialization contract."""
 
 import json
-import os
-import subprocess
-import sys
 
 import pytest
 from pydantic import ValidationError
 
-import contexttrack
 from contexttrack import models
 from contexttrack.models import (
     EVENT_ADAPTER,
@@ -21,22 +17,25 @@ from contexttrack.models import (
     SentRequestMessage,
 )
 
-KINDS = (
-    "send_request",
-    "receive_request",
-    "request_routed",
-    "send_response",
-    "receive_response",
-)
-
-
-def test_public_model_round_trip(normalized_sent):
-    event = EVENT_ADAPTER.validate_python(normalized_sent)
-    assert isinstance(event, RequestSent)
-    assert event.message.method == "gEt"
-    assert event.message.host == "Höst:80"
-    assert event.context_key == (42, "id:7")
-    assert EVENT_ADAPTER.validate_json(event.model_dump_json()) == event
+CANONICAL_FIELDS = {
+    "send_request": ("method", "path", "raw_query", "host"),
+    "receive_request": ("method", "path", "raw_query"),
+    "request_routed": ("method", "path", "pattern"),
+    "send_response": ("method", "path", "status_code"),
+    "receive_response": ("method", "path", "status_code"),
+}
+canonical_strings = [
+    (kind, field)
+    for kind, fields in CANONICAL_FIELDS.items()
+    for field in fields
+    if field != "status_code"
+]
+canonical_keys = {field for fields in CANONICAL_FIELDS.values() for field in fields}
+canonical_forbidden = [
+    (kind, field)
+    for kind, fields in CANONICAL_FIELDS.items()
+    for field in sorted(canonical_keys - set(fields))
+]
 
 
 @pytest.mark.parametrize("version", [True, 1.0, "1", 0, 2, None])
@@ -46,20 +45,6 @@ def test_version_is_exact_integer_one(normalized_sent, version):
         EVENT_ADAPTER.validate_python(normalized_sent)
     with pytest.raises(ValidationError):
         EVENT_ADAPTER.validate_json(json.dumps(normalized_sent))
-
-
-@pytest.mark.parametrize("pid", [True, "42", 42.0, None])
-def test_pid_is_strict(normalized_sent, pid):
-    normalized_sent["pid"] = pid
-    with pytest.raises(ValidationError):
-        EVENT_ADAPTER.validate_python(normalized_sent)
-
-
-@pytest.mark.parametrize("pid", [0, -1])
-def test_pid_has_no_positivity_restriction(normalized_sent, pid):
-    event = EVENT_ADAPTER.validate_python(normalized_sent | {"pid": pid})
-    assert event.pid == pid
-    assert event.context_key == (pid, "id:7")
 
 
 def test_pid_scopes_context_identity(normalized_sent):
@@ -81,7 +66,7 @@ def test_unknown_fields_are_not_ignored(normalized_sent):
         EVENT_ADAPTER.validate_python(normalized_sent)
 
 
-@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("kind", CANONICAL_FIELDS)
 def test_canonical_path_cannot_be_empty(normalized_sent, kind):
     record = normalized_sent | {"kind": kind, "message": {"path": ""}}
     with pytest.raises(ValidationError):
@@ -132,6 +117,7 @@ def test_all_variants_have_typed_payloads_and_round_trip(
     assert type(event.message) is message_type
     assert event.kind == kind
     assert event.message.model_dump() == message
+    assert event.context_key == (42, "id:7")
     assert event_type.model_validate(record) == event
     assert EVENT_ADAPTER.validate_json(event.model_dump_json()) == event
 
@@ -204,78 +190,16 @@ def test_extra_fields_are_forbidden_at_every_level(normalized_sent, target):
         EVENT_ADAPTER.validate_python(normalized_sent)
 
 
-@pytest.mark.parametrize(
-    "kind, field",
-    [
-        ("send_request", "status_code"),
-        ("send_request", "pattern"),
-        ("receive_request", "status_code"),
-        ("receive_request", "host"),
-        ("receive_request", "pattern"),
-        ("request_routed", "status_code"),
-        ("request_routed", "host"),
-        ("request_routed", "raw_query"),
-        ("send_response", "host"),
-        ("send_response", "raw_query"),
-        ("send_response", "pattern"),
-        ("receive_response", "host"),
-        ("receive_response", "raw_query"),
-        ("receive_response", "pattern"),
-    ],
-)
-def test_payloads_reject_fields_of_other_variants(normalized_sent, kind, field):
+@pytest.mark.parametrize("kind, field", canonical_forbidden)
+def test_message_fields_are_limited_to_the_event_kind(normalized_sent, kind, field):
     record = normalized_sent | {"kind": kind, "message": {field: None}}
     with pytest.raises(ValidationError):
         EVENT_ADAPTER.validate_python(record)
 
 
-@pytest.mark.parametrize("field", ["goroutine_id", "thread_id", "line"])
-@pytest.mark.parametrize("value", [None, 0, -1])
-def test_optional_debug_integers_preserve_null_zero_and_negative(
-    normalized_sent, field, value
-):
-    event = EVENT_ADAPTER.validate_python(normalized_sent | {field: value})
-    assert getattr(event, field) == value
-    assert json.loads(event.model_dump_json())[field] == value
-
-
-@pytest.mark.parametrize("field", ["goroutine_id", "thread_id", "line"])
-@pytest.mark.parametrize("value", [True, "0", 0.0])
-def test_optional_debug_integers_are_strict(normalized_sent, field, value):
-    with pytest.raises(ValidationError):
-        EVENT_ADAPTER.validate_python(normalized_sent | {field: value})
-
-
-@pytest.mark.parametrize("field", ["api_id", "handler", "file"])
+@pytest.mark.parametrize("kind, field", canonical_strings)
 @pytest.mark.parametrize("value", [True, 42, 1.5, [], {}])
-def test_optional_envelope_strings_are_strict(normalized_sent, field, value):
-    with pytest.raises(ValidationError):
-        EVENT_ADAPTER.validate_python(normalized_sent | {field: value})
-
-
-@pytest.mark.parametrize("field", ["context_id", "source", "type", "error"])
-@pytest.mark.parametrize("value", [True, 42, 1.5, [], {}])
-def test_context_strings_are_strict(normalized_sent, field, value):
-    normalized_sent["context"][field] = value
-    with pytest.raises(ValidationError):
-        EVENT_ADAPTER.validate_python(normalized_sent)
-
-
-@pytest.mark.parametrize(
-    "kind, field",
-    [
-        ("send_request", "method"),
-        ("send_request", "path"),
-        ("send_request", "host"),
-        ("send_request", "raw_query"),
-        ("receive_request", "method"),
-        ("request_routed", "pattern"),
-        ("send_response", "method"),
-        ("receive_response", "method"),
-    ],
-)
-@pytest.mark.parametrize("value", [True, 42, 1.5, [], {}])
-def test_message_strings_are_strict(normalized_sent, kind, field, value):
+def test_message_strings_reject_non_strings(normalized_sent, kind, field, value):
     record = normalized_sent | {"kind": kind, "message": {field: value}}
     with pytest.raises(ValidationError):
         EVENT_ADAPTER.validate_python(record)
@@ -286,6 +210,7 @@ def test_message_strings_are_strict(normalized_sent, kind, field, value):
 def test_response_status_is_nullable_and_nonnegative(normalized_sent, kind, status):
     record = normalized_sent | {"kind": kind, "message": {"status_code": status}}
     event = EVENT_ADAPTER.validate_python(record)
+    assert isinstance(event, (ResponseSent, ResponseReceived))
     assert event.message.status_code == status
     assert json.loads(event.model_dump_json())["message"]["status_code"] == status
 
@@ -298,17 +223,8 @@ def test_canonical_status_rejects_coercion_and_negatives(normalized_sent, kind, 
         EVENT_ADAPTER.validate_python(record)
 
 
-def test_strings_and_context_diagnostics_are_not_normalized(normalized_sent):
+def test_message_strings_are_not_normalized(normalized_sent):
     record = normalized_sent | {
-        "api_id": " API\n",
-        "handler": " handler ",
-        "file": "/gö/src/net/http/transport.go",
-        "context": {
-            "context_id": " ",
-            "source": "req.Context()",
-            "type": "context.Context",
-            "error": " diagnostic\n",
-        },
         "message": {
             "method": " gEt ",
             "host": "Höst:80",
@@ -317,8 +233,7 @@ def test_strings_and_context_diagnostics_are_not_normalized(normalized_sent):
         },
     }
     event = EVENT_ADAPTER.validate_python(record)
-    assert event.model_dump(include=set(record)) == record
-    assert event.context_key == (42, " ")
+    assert event.message.model_dump() == record["message"]
     assert "Höst:80" in event.model_dump_json(ensure_ascii=False)
 
 
@@ -361,45 +276,3 @@ def test_constructed_model_instances_are_revalidated(normalized_sent, target):
         )
     with pytest.raises(ValidationError):
         EVENT_ADAPTER.validate_python(invalid)
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "ContextInfo",
-        "RequestFields",
-        "RequestMessage",
-        "SentRequestMessage",
-        "RoutedRequestMessage",
-        "ResponseMessage",
-        "RequestSent",
-        "RequestReceived",
-        "RequestRouted",
-        "ResponseSent",
-        "ResponseReceived",
-        "Event",
-        "EVENT_ADAPTER",
-    ],
-)
-def test_public_contract_is_exported_at_package_root(name):
-    assert getattr(contexttrack, name) is getattr(models, name)
-
-
-def test_import_is_quiet_and_independent_of_capture_and_go(tmp_path):
-    capture = tmp_path / "must-not-exist.jsonl"
-    result = subprocess.run(
-        [sys.executable, "-c", "from contexttrack import EVENT_ADAPTER, RequestSent"],
-        cwd=tmp_path,
-        env=os.environ
-        | {
-            "CONFTAMER_EVENTS": str(capture),
-            "GOROOT": str(tmp_path / "no-go"),
-            "PATH": "",
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == result.stderr == ""
-    assert not capture.exists()

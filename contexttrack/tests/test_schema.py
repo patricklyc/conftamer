@@ -1,11 +1,19 @@
-"""Keep the published normalized v1 schema in sync with the public models."""
+"""Check public schema generation without a checked-in snapshot."""
 
 import json
-from pathlib import Path
+import subprocess
+import sys
 
 from contexttrack.models import EVENT_ADAPTER
 
 
-def test_committed_schema_is_generated_from_models():
-    path = Path(__file__).parents[1] / "schemas/contexttrack-event-v1.schema.json"
-    assert json.loads(path.read_text(encoding="utf-8")) == EVENT_ADAPTER.json_schema()
+def test_cli_schema_agrees_with_models():
+    result = subprocess.run(
+        [sys.executable, "-m", "contexttrack", "schema"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == EVENT_ADAPTER.json_schema()

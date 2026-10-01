@@ -49,10 +49,8 @@ func conftamerOn() bool {
 	return conftamerEnabled
 }
 
-// init prints a one-line diagnostic to stderr at process start whenever the
-// user opted in via CONFTAMER_EVENTS.
-// It runs eagerly (not lazily on the first hook) to make it easy to differentiate
-// between "file exists but no events at all" and "file doesn't exist".
+// init reports opt-in capture status at process start, distinguishing an empty
+// capture from an open failure before any hook runs.
 func init() {
 	if os.Getenv("CONFTAMER_EVENTS") == "" {
 		return
@@ -64,7 +62,7 @@ func init() {
 	}
 }
 
-// --- event schema --------------------
+// Event schema.
 
 type conftamerEvent struct {
 	Kind        string                `json:"kind"`
@@ -95,7 +93,7 @@ type conftamerContextInfo struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// --- context ID (correlation key) -----------------------------------------
+// Context ID (correlation key).
 //
 // An explicit, process-local, monotonically-increasing request ID stamped
 // into the request context at its origin and inherited by every derived context.
@@ -126,7 +124,7 @@ func conftamerStampID(ctx context.Context) context.Context {
 	return context.WithValue(ctx, conftamerIDKey, conftamerNextID.Add(1))
 }
 
-// --- private outbound request copies ----------------------------------------
+// Private outbound request copies.
 //
 // An outbound request whose context lacks an ID is sent as a private copy with
 // a stamped context: stamping the caller's request in place would race with
@@ -196,7 +194,7 @@ func conftamerContext(ctx context.Context) *conftamerContextInfo {
 	}
 }
 
-// --- caller (API_ID) identification ----------------------
+// Caller (API ID) identification.
 
 var conftamerHTTPLayerPackages = map[string]bool{
 	"net/http":               true,
@@ -211,7 +209,6 @@ var conftamerMultiTenantHosts = map[string]bool{
 
 type conftamerCaller struct {
 	FuncName string
-	Package  string
 	ApiId    string
 }
 
@@ -253,9 +250,8 @@ func conftamerApiID(pkg string) string {
 	return segs[0]
 }
 
-// Walks the current goroutine's stack and returns the first
-// frame whose package is not in "conftamerHTTPLayerPackages"
-// (inferred to be "generic helpers" and not the calling applciation).
+// conftamerFindCaller infers the application caller from the first stack frame
+// outside conftamerHTTPLayerPackages.
 func conftamerFindCaller() *conftamerCaller {
 	var pcs [50]uintptr
 	n := runtime.Callers(2, pcs[:])
@@ -267,7 +263,7 @@ func conftamerFindCaller() *conftamerCaller {
 		f, more := frames.Next()
 		pkg := conftamerPackageName(f.Function)
 		if pkg != "" && !conftamerHTTPLayerPackages[pkg] {
-			return &conftamerCaller{FuncName: f.Function, Package: pkg, ApiId: conftamerApiID(pkg)}
+			return &conftamerCaller{FuncName: f.Function, ApiId: conftamerApiID(pkg)}
 		}
 		if !more {
 			break
@@ -283,11 +279,9 @@ func conftamerHandlerCaller(handler any) *conftamerCaller {
 	if handler == nil {
 		return nil
 	}
-	// get "real" type if this is stored as "any"
 	v := reflect.ValueOf(handler)
 	var pkg, name string
 	if v.Kind() == reflect.Func { // e.g., `http.HandlerFunc(...)`
-		// Get function pointer -> look up address in `runtime` to get func metadata
 		if fn := runtime.FuncForPC(v.Pointer()); fn != nil {
 			name = fn.Name()
 			pkg = conftamerPackageName(name)
@@ -297,17 +291,14 @@ func conftamerHandlerCaller(handler any) *conftamerCaller {
 		for t.Kind() == reflect.Ptr {
 			t = t.Elem()
 		}
-		// Look for package where type is defined
 		pkg = t.PkgPath()
 		name = t.String()
 	}
 	if pkg == "" || conftamerHTTPLayerPackages[pkg] {
 		return nil
 	}
-	return &conftamerCaller{FuncName: name, Package: pkg, ApiId: conftamerApiID(pkg)}
+	return &conftamerCaller{FuncName: name, ApiId: conftamerApiID(pkg)}
 }
-
-// --- metadata --------------------------------------------------------------
 
 func conftamerGoID() int {
 	var buf [64]byte
@@ -320,8 +311,6 @@ func conftamerGoID() int {
 	}
 	return 0
 }
-
-// --- logging entry point -----------------------------------------------
 
 // conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
 // reqID (may be nil) is set for "Request sent". withCaller enables caller identification.
@@ -416,9 +405,10 @@ func ConftamerLogRouted(pattern string, r *Request) {
 }
 
 // Response received at HTTP/1 header parsing or HTTP/2 header delivery, including
-// direct Transport.RoundTrip calls. No caller ID: the HTTP/1 read loop has no
-// application caller on its stack; consumers can attribute either protocol's
-// response to its request. r may be nil when request metadata is unavailable.
+// direct Transport.RoundTrip calls; Client.do may log the same response again.
+// No caller ID: the HTTP/1 read loop has no application caller on its stack.
+// Consumers can attribute either protocol's response to its request.
+// r may be nil when request metadata is unavailable.
 func conftamerLogResponseWire(kind string, code int, ctx context.Context, r *Request) {
 	if !conftamerOn() {
 		return

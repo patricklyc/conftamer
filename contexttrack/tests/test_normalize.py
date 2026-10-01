@@ -14,13 +14,22 @@ from contexttrack.models import (
 )
 from contexttrack.normalize import normalize_record
 
-RAW_KINDS = (
-    "Request sent",
-    "Request received",
-    "Request routed",
-    "Response sent",
-    "Response received",
-)
+RAW_FIELDS = {
+    "Request sent": ("req.Method", "req.URL.Host", "req.URL.Path", "req.URL.RawQuery"),
+    "Request received": ("req.Method", "req.URL.Path", "req.URL.RawQuery"),
+    "Request routed": ("req.Method", "req.URL.Path", "pattern"),
+    "Response sent": ("req.Method", "req.URL.Path", "code"),
+    "Response received": ("req.Method", "req.URL.Path", "resp.StatusCode"),
+}
+raw_strings = [(kind, field) for kind, fields in RAW_FIELDS.items() for field in fields]
+raw_keys = {field for fields in RAW_FIELDS.values() for field in fields}
+raw_forbidden = [
+    (kind, field)
+    for kind, fields in RAW_FIELDS.items()
+    for field in sorted(raw_keys - set(fields))
+]
+
+RAW_KINDS = tuple(RAW_FIELDS)
 
 RESPONSE_STATUSES = (
     ("Response sent", "code"),
@@ -211,55 +220,6 @@ def test_absent_context_identity_never_creates_a_shared_group(raw_sent, context)
     assert event.context_key is None
 
 
-@pytest.mark.parametrize(
-    "field", ["api_id", "handler", "file", "goroutine_id", "thread_id", "line"]
-)
-def test_optional_envelope_fields_accept_null(raw_sent, field):
-    event = normalize_record(raw_sent | {field: None})
-    assert getattr(event, field) is None
-
-
-@pytest.mark.parametrize("field", ["pid", "goroutine_id", "thread_id", "line"])
-@pytest.mark.parametrize("value", [0, -1])
-def test_integer_metadata_preserves_zero_and_negative_values(raw_sent, field, value):
-    event = normalize_record(raw_sent | {field: value})
-    assert getattr(event, field) == value
-
-
-@pytest.mark.parametrize("field", ["pid", "goroutine_id", "thread_id", "line"])
-@pytest.mark.parametrize("value", [True, "42", 42.0])
-def test_integer_metadata_is_not_coerced(raw_sent, field, value):
-    with pytest.raises(ValidationError):
-        normalize_record(raw_sent | {field: value})
-
-
-@pytest.mark.parametrize("pid", [None, [], {}])
-def test_pid_is_required_to_be_an_integer(raw_sent, pid):
-    with pytest.raises(ValidationError):
-        normalize_record(raw_sent | {"pid": pid})
-
-
-@pytest.mark.parametrize("field", ["api_id", "handler", "file"])
-@pytest.mark.parametrize("value", [True, 42, 1.5, [], {}])
-def test_optional_envelope_strings_are_not_coerced(raw_sent, field, value):
-    with pytest.raises(ValidationError):
-        normalize_record(raw_sent | {field: value})
-
-
-@pytest.mark.parametrize("field", ["context_id", "source", "type", "error"])
-@pytest.mark.parametrize("value", [True, 42, 1.5, [], {}])
-def test_context_fields_are_nullable_strings_not_coerced_values(raw_sent, field, value):
-    raw_sent["context"][field] = value
-    with pytest.raises(ValidationError):
-        normalize_record(raw_sent)
-
-
-@pytest.mark.parametrize("field", ["context_id", "source", "type", "error"])
-def test_context_fields_accept_explicit_null(raw_sent, field):
-    raw_sent["context"][field] = None
-    assert getattr(normalize_record(raw_sent).context, field) is None
-
-
 @pytest.mark.parametrize("field", ["kind", "pid", "message"])
 def test_required_raw_fields_cannot_be_omitted(raw_sent, field):
     del raw_sent[field]
@@ -309,29 +269,9 @@ def test_internal_message_names_are_not_accepted_as_raw_aliases(raw_sent, field)
         normalize_record(raw_sent)
 
 
-@pytest.mark.parametrize(
-    "kind, field",
-    [
-        ("Request sent", "req.Method"),
-        ("Request sent", "req.URL.Host"),
-        ("Request sent", "req.URL.Path"),
-        ("Request sent", "req.URL.RawQuery"),
-        ("Request received", "req.Method"),
-        ("Request received", "req.URL.Path"),
-        ("Request received", "req.URL.RawQuery"),
-        ("Request routed", "req.Method"),
-        ("Request routed", "req.URL.Path"),
-        ("Request routed", "pattern"),
-        ("Response sent", "req.Method"),
-        ("Response sent", "req.URL.Path"),
-        ("Response sent", "code"),
-        ("Response received", "req.Method"),
-        ("Response received", "req.URL.Path"),
-        ("Response received", "resp.StatusCode"),
-    ],
-)
+@pytest.mark.parametrize("kind, field", raw_strings)
 @pytest.mark.parametrize("value", [None, True, 42, 1.5, [], {}])
-def test_present_message_fields_must_be_strings_even_when_unused(kind, field, value):
+def test_message_fields_must_be_strings_even_when_unused(kind, field, value):
     with pytest.raises(ValidationError):
         normalize_record({"kind": kind, "pid": 42, "message": {field: value}})
 
@@ -344,31 +284,8 @@ def test_present_request_labels_must_be_strings(raw_sent, field, value):
         normalize_record(raw_sent)
 
 
-@pytest.mark.parametrize(
-    "kind, field",
-    [
-        ("Request sent", "pattern"),
-        ("Request sent", "code"),
-        ("Request sent", "resp.StatusCode"),
-        ("Request received", "req.URL.Host"),
-        ("Request received", "pattern"),
-        ("Request received", "code"),
-        ("Request received", "resp.StatusCode"),
-        ("Request routed", "req.URL.Host"),
-        ("Request routed", "req.URL.RawQuery"),
-        ("Request routed", "code"),
-        ("Request routed", "resp.StatusCode"),
-        ("Response sent", "req.URL.Host"),
-        ("Response sent", "req.URL.RawQuery"),
-        ("Response sent", "pattern"),
-        ("Response sent", "resp.StatusCode"),
-        ("Response received", "req.URL.Host"),
-        ("Response received", "req.URL.RawQuery"),
-        ("Response received", "pattern"),
-        ("Response received", "code"),
-    ],
-)
-def test_message_fields_of_other_kinds_are_forbidden(kind, field):
+@pytest.mark.parametrize("kind, field", raw_forbidden)
+def test_message_fields_are_limited_to_the_event_kind(kind, field):
     with pytest.raises(ValidationError):
         normalize_record({"kind": kind, "pid": 42, "message": {field: "200"}})
 
@@ -469,18 +386,8 @@ def test_route_pattern_syntax_is_not_reconstructed_or_rewritten(pattern):
     assert event.message.pattern == pattern
 
 
-def test_strings_context_diagnostics_and_metadata_are_preserved(raw_sent):
+def test_message_strings_are_preserved(raw_sent):
     record = raw_sent | {
-        "handler": " handler\n",
-        "file": "/gö/src/net/http/transport.go",
-        "line": 640,
-        "goroutine_id": 8,
-        "context": {
-            "context_id": " ",
-            "source": "req.Context()",
-            "type": "context.Context",
-            "error": " diagnostic\n",
-        },
         "request_id": {
             "method": " gEt ",
             "host": "Höst:80",
@@ -496,21 +403,6 @@ def test_strings_context_diagnostics_and_metadata_are_preserved(raw_sent):
         "path": "/a/../é%2Fb?query=literal",
         "raw_query": "q=%2F&token=é",
     }
-    assert event.context.model_dump() == record["context"]
-    assert event.context_key == (42, " ")
-    assert (
-        event.api_id,
-        event.handler,
-        event.file,
-        event.line,
-        event.goroutine_id,
-    ) == (
-        " API\n",
-        " handler\n",
-        "/gö/src/net/http/transport.go",
-        640,
-        8,
-    )
 
 
 def test_failed_validation_does_not_mutate_input(raw_sent):

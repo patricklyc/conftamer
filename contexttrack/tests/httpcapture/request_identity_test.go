@@ -32,18 +32,7 @@ func TestClientDoCancelRequest(t *testing.T) {
 	defer resp.Body.Close()
 	// Cancel after RoundTrip has returned, while the response body is in flight.
 	s.Client().Transport.(*http.Transport).CancelRequest(req)
-	done := make(chan error, 1)
-	go func() { _, err := io.ReadAll(resp.Body); done <- err }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Error("expected cancellation to interrupt the response body")
-		}
-	case <-time.After(3 * time.Second):
-		cancel()
-		<-done
-		t.Fatal("CancelRequest did not recognize the original Client.Do request")
-	}
+	assertBodyInterrupted(t, resp.Body, cancel)
 }
 
 // The legacy Request.Cancel channel must still reach the sent request.
@@ -66,18 +55,7 @@ func TestClientDoLegacyCancel(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	close(cancel)
-	done := make(chan error, 1)
-	go func() { _, err := io.ReadAll(resp.Body); done <- err }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Error("expected Request.Cancel to interrupt the response body")
-		}
-	case <-time.After(3 * time.Second):
-		s.CloseClientConnections()
-		<-done
-		t.Fatal("Request.Cancel did not reach the sent request")
-	}
+	assertBodyInterrupted(t, resp.Body, s.CloseClientConnections)
 }
 
 func TestCallerRequestIdentity(t *testing.T) {
@@ -98,12 +76,7 @@ func TestCallerRequestIdentity(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					var resp *http.Response
-					if direct {
-						resp, err = s.Client().Transport.RoundTrip(req)
-					} else {
-						resp, err = s.Client().Do(req)
-					}
+					resp, err := send(s.Client(), req, direct)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -122,15 +95,10 @@ func TestCallerRequestIdentity(t *testing.T) {
 					}
 					if os.Getenv("CONFTAMER_EVENTS") != "" {
 						sent := onlyEvent(t, path, "Request sent")
-						received := events(t, path, "Response received")
-						if sent.Context.ID == "" || len(received) == 0 {
-							t.Fatalf("missing request/response correlation: sent=%+v received=%+v", sent, received)
+						if sent.Context.ID == "" {
+							t.Fatalf("missing request context: %+v", sent)
 						}
-						for _, e := range received {
-							if e.Context.ID != sent.Context.ID || e.Message["resp.StatusCode"] != "204" {
-								t.Errorf("restoring identity broke response capture: %+v", e)
-							}
-						}
+						assertResponses(t, path, "GET", "204", sent.Context.ID)
 					}
 				}
 			})

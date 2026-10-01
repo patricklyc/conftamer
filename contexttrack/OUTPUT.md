@@ -1,129 +1,77 @@
 # Normalized ContextTrack event contract
 
-This document defines the public **normalized event schema, version 1**, implemented
-in [`src/contexttrack/models.py`](src/contexttrack/models.py). It is distinct from
-the unversioned raw Go capture described in the [README](README.md).
+## Boundaries and versioning
 
-**Published interface:** ContextTrack `0.2.0` provides typed models, pure
-raw-record normalization, strict streaming JSONL readers/writers, normalization
-and schema CLIs, a typing marker, and a
-[model-generated schema snapshot](schemas/contexttrack-event-v1.schema.json).
-Package version `0.2.0` is independent of normalized schema version `1`. Go
-instrumentation and raw captures are unchanged. The existing `analysis/` scripts
-and `conftamer-cli/node-query` importer still require raw input, not normalized
-JSON. [Task 5 acceptance and audit status](docs/contexttrack-normalized-events-task5.md)
-separates unit, committed-fixture, installed-wheel, and native-producer evidence
-from the still-pending complete-project human sign-off.
+ContextTrack **0.2.0** provides typed events, pure raw-record normalization,
+streaming JSONL I/O, normalize/schema CLIs, and `py.typed`. It requires Python
+**>=3.14** and Pydantic **>=2.13.5,<3**. Package version is independent of the
+normalized **schema version 1**; Go's current raw format remains unversioned.
+[README](README.md) owns capture, installation, tests, and application caveats.
 
-## Purpose and boundaries
+The [HotNets paper](../../ConfTamer_HotNets_2026.pdf), §§4–5/Figure 3, defines
+per-module PMGraphs from inputs (parameters and received messages) to outputs
+(sent messages), followed by separate AppGraph composition. This API retains
+message/context evidence, **not a PMGraph/AppGraph or exact per-request causality**.
+Parameter ingestion/discovery and cross-module stitching are outside it.
+Routes are observations, not message nodes. Missing labels do not automatically
+become usable downstream nodes. Consumer migration is separately authorized
+[below](#consumer-handoff-separately-authorized-work); `analysis/` and the current
+`conftamer-cli/node-query` importer still take raw captures only.
 
-Events retain message/context evidence. They are neither a PMGraph nor an
-AppGraph and do not establish exact per-request causality. In the
-[HotNets design](../../ConfTamer_HotNets_2026.pdf), a per-module PMGraph relates
-inputs (parameters and received messages) to outputs (sent messages); a separate
-composition step builds an AppGraph. Those steps, parameter ingestion, and
-cross-module stitching are outside this API.
+## Envelope and context
 
-A routing observation is its own event, not a message node. Responses are not
-matched to requests or enriched with host, API ID, handler, or route pattern by
-the models. Missing labels are accepted as missing evidence, not automatically
-made into usable downstream message nodes. Repeated hooks remain separate
-observations; validation does not deduplicate or order them.
-
-## Format and validation
-
-- Each normalized event is a JSON object with required integer
-  `schema_version: 1`. This is the normalized format version, not a patch,
-  package, or historical experimental format version.
-- `kind` selects one of the five concrete models below. Unknown kinds,
-  versions, or fields are errors, including unknown nested fields. Fields
-  belonging to another payload type are forbidden even when their value is
-  null. Schema additions require an explicitly supported version.
-- All wire models use Pydantic's
-  `ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")`.
-  Ordinary assignment to an event or nested model is rejected. Adapter
-  validation also revalidates model instances, including values created by
-  unchecked Pydantic construction/copy helpers; validate before serialization.
-- Types are not coerced: boolean/string/float values are not integers, and
-  non-string values are not strings. A dedicated version validator rejects
-  `true`, `1.0`, and `"1"` as schema versions; strict `Literal[1]` alone is not
-  sufficient on Pydantic 2.13.5.
-- Nullable fields default to `None` when omitted and serialize as explicit
-  JSON nulls. Required envelope fields and the `message` object have no defaults.
-  In particular, `context` must be an object, not null; `{}` represents absent
-  context evidence. An empty `message` object is valid incomplete evidence.
-- A present `path` must be a nonempty string. The models reject `""`; they do
-  not normalize it to `"/"`. Null means unavailable evidence. Other strings may
-  be empty, and strings are preserved without trimming, case conversion, URL
-  decoding, query stripping, or route-syntax conversion.
-- Response `status_code` is null or a strict nonnegative integer. Values such
-  as `0`, `200`, and `999` are accepted; there is no 100-599 restriction. Raw
-  status-string conversion is not performed by these models.
-
-The normalized file format is UTF-8 JSONL, with one event object and a newline
-per serialized record. The model adapter parses a single event, not a JSONL file;
-encoding, duplicate-key checks, physical-line diagnostics, and safe file
-publication are provided by [`contexttrack.io`](src/contexttrack/io.py). Direct
-`EVENT_ADAPTER.validate_json` validates model shape but does not provide those
-additional file-level checks.
-
-## Envelope
-
-Every concrete event carries these fields, plus its required typed `message`:
+[`models.py`](src/contexttrack/models.py) defines each event as a JSON object:
 
 | Field | Type | Required / default | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | Exact integer `1` | Required | Normalized format version |
-| `kind` | Canonical string literal | Required | Event discriminator |
+| `schema_version` | Exact integer `1` | Required | Normalized format version, not package/patch version |
+| `kind` | Canonical literal below | Required | Discriminator |
 | `pid` | Strict integer | Required | Producer process ID |
-| `context` | `ContextInfo` object | Required | Context evidence and diagnostics |
-| `api_id` | String or null | Null | Best-effort package/API association, not a PMGraph `module_id` |
-| `handler` | String or null | Null | Handler evidence, when present |
-| `goroutine_id` | Strict integer or null | Null | Optional Go debug metadata |
-| `thread_id` | Strict integer or null | Null | Optional debug metadata; zero is preserved |
+| `context` | `ContextInfo` object | Required | Context evidence/diagnostics |
+| `message` | Typed payload below | Required | Message/routing evidence |
+| `api_id` | String or null | Null | Best-effort package/API association, **not** PMGraph `module_id` |
+| `handler` | String or null | Null | Handler evidence |
+| `goroutine_id` | Strict integer or null | Null | Go debug metadata |
+| `thread_id` | Strict integer or null | Null | Debug metadata |
 | `file` | String or null | Null | Source/debug path |
-| `line` | Strict integer or null | Null | Source/debug line |
+| `line` | Strict integer or null | Null | Source/debug line, not reader location |
 
-No positivity restriction is imposed on `pid`, `goroutine_id`, `thread_id`, or
-`line`. Null and zero remain distinct. Reader locations and capture/occurrence
-IDs are not added to this envelope.
+`pid` and debug integers have no positivity restriction; zero and null differ.
+No capture/occurrence ID, reader location, or wire `request_id` is added.
+`ContextInfo` has these fields, all nullable strings defaulting to null:
 
-`ContextInfo` has four nullable string fields, each defaulting to null:
-`context_id`, `source`, `type`, and `error`. It preserves context diagnostics;
-there is no historical `root_addr` field in the normalized contract.
+| Field | Meaning |
+| --- | --- |
+| `context_id` | Process-local context label |
+| `source` | Context source diagnostic |
+| `type` | Context type diagnostic |
+| `error` | Context lookup diagnostic |
+
+Historical `root_addr` is not supported. `{}` represents absent context evidence;
+normalized `context` cannot be omitted or null.
 
 ### Context identity
 
-All events expose the non-serialized property:
+Each event's non-serialized `context_key: tuple[int, str] | None` returns
+`(pid, context.context_id)` for a nonempty ID; omitted/null/empty IDs yield `None`,
+not a shared invented "unknown" group. Whitespace is preserved and is not empty.
+Group by **PID and ID within one capture**, never ID alone. IDs are process-local
+influence heuristics, not distributed trace IDs or exact HTTP exchange identities;
+reusing an append-only raw file does not establish cross-run identity.
 
-```python
-context_key: tuple[int, str] | None
-```
+## Payloads and variants
 
-It returns `(pid, context.context_id)` only for a nonempty context ID. An omitted,
-null, or empty ID returns `None`; unrelated records must not share an invented
-"unknown" group. IDs are process-local influence heuristics within one capture,
-not globally unique distributed trace IDs or exact HTTP exchange identities.
-Do not group by `context_id` alone or infer cross-run identity from a reused
-append-only raw file. Whitespace in an ID is preserved, not treated as empty.
+Every payload field defaults to null. Inheritance exposes the base fields too:
 
-## Typed payloads and event variants
+| Public payload model | Base | Own fields |
+| --- | --- | --- |
+| `RequestFields` | — | `method: str \| None`, `path: str \| None` (nonempty when present) |
+| `RequestMessage` | `RequestFields` | `raw_query: str \| None` |
+| `SentRequestMessage` | `RequestMessage` | `host: str \| None` |
+| `RoutedRequestMessage` | `RequestFields` | `pattern: str \| None` |
+| `ResponseMessage` | `RequestFields` | `status_code: int \| None` (strict, nonnegative) |
 
-`RequestFields` supplies nullable strings `method` and `path`. Payload models
-inherit these fields, with the additional nullable fields listed here:
-
-| Payload model | Additional fields |
-| --- | --- |
-| `RequestMessage(RequestFields)` | `raw_query: str \| None` |
-| `SentRequestMessage(RequestMessage)` | `host: str \| None` |
-| `RoutedRequestMessage(RequestFields)` | `pattern: str \| None` |
-| `ResponseMessage(RequestFields)` | `status_code: int \| None` (strict, nonnegative) |
-
-`raw_query=None` is missing evidence; `raw_query=""` is an explicitly empty query.
-`pattern` retains the handler syntax separately from the concrete `path`;
-examples include `GET /items/{id}`, `:name`, and `*path`.
-
-| Concrete event | Required `kind` | Required `message` type |
+| Public event model | Required `kind` | Required `message` type |
 | --- | --- | --- |
 | `RequestSent` | `send_request` | `SentRequestMessage` |
 | `RequestReceived` | `receive_request` | `RequestMessage` |
@@ -131,73 +79,53 @@ examples include `GET /items/{id}`, `:name`, and `*path`.
 | `ResponseSent` | `send_response` | `ResponseMessage` |
 | `ResponseReceived` | `receive_response` | `ResponseMessage` |
 
-Requests reject `status_code`; responses reject `host`, `raw_query`, and
-`pattern`. Routing rejects request-query and host fields. No event carries a
-wire `request_id`: outbound method/host/path are endpoint labels in the typed
-message, not occurrence or correlation IDs. The normalizer uses the raw
-`request_id` as the sole source of those outbound endpoint labels.
+`raw_query=null` is unavailable evidence; `""` is an explicitly empty query.
+`pattern` stays separate from concrete `path`, preserving syntaxes such as
+`GET /items/{id}`, `:name`, and `*path`. Outbound method/host/path are endpoint
+labels, not occurrence/correlation IDs. Responses have no host field and are
+not enriched with API ID, handler, or route pattern from other observations.
 
-## Raw-record normalization
+### Canonical validation
 
-[`contexttrack.normalize.normalize_record(record: object) -> Event`](src/contexttrack/normalize.py)
-validates and converts **one current unversioned `contexttrack-fix-v1` raw
-record** into an immutable normalized v1 event. The same raw format is retained
-by the overlay tooling. This API is not an importer for historical root-address
-or v2/v3/v4/v5 experiments, and already-normalized records are not raw input.
+All wire models use
+`ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")`:
 
-### Mapping
+- Unknown kinds, versions, and envelope/nested fields fail. Another payload's
+  fields are forbidden even when null: requests reject `status_code`; responses
+  reject `host`, `raw_query`, `pattern`; routes reject `host`, `raw_query`.
+- No coercion: booleans/strings/floats are not integers; nonstrings are not strings.
+  A dedicated validator rejects `true`, `1.0`, and `"1"` for `schema_version`;
+  strict `Literal[1]` alone is insufficient on Pydantic 2.13.5.
+- Required fields have no defaults. `message` must be an object, not null;
+  `{}` is valid incomplete evidence. Nullable fields may be omitted and serialize
+  as explicit nulls. Present paths must be nonempty; canonical `""` is rejected,
+  not changed to `"/"`. Other strings may be empty.
+- `status_code` is null or a strict nonnegative integer, without a 100–599
+  restriction (`0`, `200`, `999` are valid); models do not convert status strings.
+- Ordinary assignment to events/nested models fails. Adapter validation
+  revalidates even unchecked Pydantic `model_construct`/copy instances;
+  validate before serialization.
+
+Strings are otherwise preserved: no trimming, method uppercasing, host lowercasing,
+URL decoding/cleaning, query stripping, or route-syntax conversion.
+
+## Raw mapping and strictness differences
+
+[`normalize_record(record: object) -> Event`](src/contexttrack/normalize.py)
+accepts one **current unversioned fixed-producer raw record**, as retained by the
+overlay tooling. It does not accept normalized records, historical root-address
+captures, or v2/v3/v4/v5 experiments. Private [`_raw.py`](src/contexttrack/_raw.py)
+models also use strict types and forbid unknown envelope/nested fields.
 
 | Raw kind | Canonical kind | Method/path source | Other payload evidence |
 | --- | --- | --- | --- |
-| `Request sent` | `send_request` | `request_id.method` / `request_id.path` | `request_id.host` and `message.req.URL.RawQuery` |
+| `Request sent` | `send_request` | `request_id.method` / `request_id.path` | `request_id.host`, `message.req.URL.RawQuery` |
 | `Request received` | `receive_request` | `message.req.Method` / `message.req.URL.Path` | `message.req.URL.RawQuery` |
 | `Request routed` | `request_routed` | `message.req.Method` / `message.req.URL.Path` | `message.pattern`, unchanged |
-| `Response sent` | `send_response` | `message.req.Method` / `message.req.URL.Path` | `message.code` converted to `status_code` |
-| `Response received` | `receive_response` | `message.req.Method` / `message.req.URL.Path` | `message.resp.StatusCode` converted to `status_code` |
+| `Response sent` | `send_response` | `message.req.Method` / `message.req.URL.Path` | `message.code` → integer `status_code` |
+| `Response received` | `receive_response` | `message.req.Method` / `message.req.URL.Path` | `message.resp.StatusCode` → integer `status_code` |
 
-- **Outbound-label precedence:** method, host, and path come only from
-  `request_id`, even when duplicate labels in the raw `message` disagree.
-  Missing/null/empty-object `request_id`, or omitted fields within it, leave
-  those labels null; the normalizer never falls back to `message`. Duplicate
-  raw message fields still undergo strict validation. Keep the untouched raw
-  capture for auditing disagreements. `request_id` is an endpoint label, not an
-  occurrence ID, and is not serialized in the normalized envelope.
-- A present empty path `""` becomes `"/"` for every kind. An omitted path
-  stays null. Empty methods/hosts are preserved rather than given defaults.
-- Request query strings retain Unicode and the distinction between omitted
-  (null) and explicitly empty (`""`). They come from the raw message, not
-  `request_id`.
-- A present response status must be a string satisfying `str.isdecimal()`;
-  conversion uses `int()`. Leading zeros are accepted (`"0200"` becomes `200`),
-  as are Unicode decimal digits. Numeric JSON values, booleans, empty strings,
-  signs, whitespace, decimal points, and nondecimal strings are rejected.
-  There is no 100-599 restriction: `"0"`, informational `"103"`, and
-  nonstandard `"999"` are accepted. Omitted statuses remain null.
-- `pid`, `api_id`, `handler`, `goroutine_id`, `thread_id`, `file`, and `line`
-  retain their values; missing optional fields become null. Zero debug values
-  stay zero. Context preserves all four known diagnostic fields. An omitted or
-  null context object becomes an all-null `ContextInfo`, without fabricating
-  identity.
-- No other values are normalized: methods are not uppercased, hosts are not
-  lowercased, strings/API IDs are not trimmed, and URLs/paths/query strings
-  are not decoded, cleaned, or stripped. Route syntax is preserved separately
-  from the concrete path, not reconstructed.
-
-### Strict raw boundary
-
-Private Pydantic models in [`_raw.py`](src/contexttrack/_raw.py) use strict types
-and forbid unknown fields at every level. Raw `kind`, integer `pid`, and object
-`message` are required. `message={}` is valid incomplete evidence; a missing,
-null, or non-object message is invalid. Context and request-label objects, API
-IDs, and optional debug metadata may be omitted/null. Existing PID/debug integer
-fields have no new positivity restrictions.
-
-Known message and `request_id` fields must be **strings when explicitly
-present**; explicit null is invalid, even for unused duplicate outbound labels.
-Omission is allowed and becomes null evidence. Context fields and optional
-envelope metadata, by contrast, accept explicit null with their declared types.
-
-Only these raw message keys are allowed for each kind:
+Only these raw message keys are legal per kind:
 
 | Raw kind | Allowed `message` keys |
 | --- | --- |
@@ -207,303 +135,262 @@ Only these raw message keys are allowed for each kind:
 | `Response sent` | `req.Method`, `req.URL.Path`, `code` |
 | `Response received` | `req.Method`, `req.URL.Path`, `resp.StatusCode` |
 
-`request_id` permits only `method`, `host`, and `path`. A non-null `request_id`
-is legal only on `Request sent`; even `{}` is forbidden on other kinds. Null
-is permitted on all five kinds. Dotted message keys are validation aliases,
-not alternate names: canonical/internal spellings such as `method`, `path`,
-and `status_code` are not accepted as raw message keys. `context.root_addr`
-and unknown raw kinds/envelope/nested keys fail explicitly; they are not
-silently ignored. This boundary is intentionally stricter than the diagnostic
-scripts and the legacy `node-query` importer's tolerance of some unconsumed
-fields.
+- Raw `kind`, strict integer `pid`, and object `message` are required; `{}` is
+  valid but missing/null/non-object messages fail. Context, request-label objects,
+  API/handler strings, and optional debug metadata may be omitted/null.
+- Known message/request-label fields must be **strings when present**, even
+  duplicate unused outbound labels; explicit null fails. Omission becomes null
+  evidence. Context fields and optional envelope metadata accept declared nulls.
+- Dotted keys are validation aliases, not alternatives to internal names;
+  canonical `method`, `path`, `status_code`, unknown keys/kinds, and `root_addr`
+  fail rather than being ignored. This is stricter than diagnostic scripts and
+  the legacy consumer's tolerance of some unconsumed fields.
+- `request_id` allows only `method`, `host`, `path`. A non-null object (even `{}`)
+  is legal only on `Request sent`; null is legal on all kinds.
+- **Outbound precedence:** only `request_id` supplies method/host/path, even if
+  duplicate message labels disagree. Missing/null/empty-object labels or omitted
+  label fields stay null; there is **no fallback to message**. Query evidence
+  still comes from `message`. Keep raw input to inspect disagreements.
+- A present empty raw path becomes `"/"` for every kind; omission stays null.
+  Empty methods/hosts and omitted-versus-empty Unicode query strings are preserved.
+- Present response status is a string satisfying `str.isdecimal()`, converted
+  with `int()`: leading zeros and Unicode decimal digits work (`"0200"` → `200`).
+  Numbers, booleans, empty strings, signs, whitespace, decimal points, and
+  nondecimal strings fail. No 100–599 restriction (`"0"`, `"103"`, `"999"` work);
+  omitted status stays null.
+- Envelope/debug values and all four context diagnostics retain their values;
+  missing optional values become null, zero stays zero. Missing/null raw context
+  becomes all-null `ContextInfo`, without fabricated identity.
 
-Each accepted raw record yields exactly one typed event. Conversion does not
-mutate the input, read/write files, warn, cache requests, infer associations,
-filter, deduplicate, or sort records. Repeated hooks and incomplete observations
-remain evidence. Responses are not enriched from other records, and no API ID,
-handler, host, route pattern, or module ownership is invented. Downstream code
-still decides which evidence can become PMGraph nodes and how to associate it.
-
-Malformed raw shapes raise Pydantic `ValidationError` (a `ValueError` subclass);
-invalid decimal status strings raise `ValueError`. The final public
-`EVENT_ADAPTER` validates the constructed canonical payload. The record-only API
-has no file location; the JSONL readers wrap these failures at their physical
-input line as described below.
+Apart from path/status conversion, strings follow the unchanged-value rules in
+[canonical validation](#canonical-validation); route syntax is not reconstructed.
+Each accepted record yields exactly one event, validated by the final public
+`EVENT_ADAPTER`, without input mutation, I/O, warnings, caching, association,
+enrichment, filtering, deduplication, or sorting. Repeated/incomplete observations
+remain separate; no host, API ID, handler, route pattern, or module ownership is
+invented. Downstream code decides usable nodes/associations. Malformed raw shapes
+raise Pydantic `ValidationError` (a `ValueError`); invalid decimal strings raise
+`ValueError`. Record-only validation has no file location.
 
 ## Streaming JSONL I/O
 
-The public interfaces in [`contexttrack.io`](src/contexttrack/io.py) accept
-`str` or `pathlib.Path` file paths:
-
-```text
-iter_raw_events(path: str | Path) -> Iterator[LocatedEvent]
-iter_events(path: str | Path) -> Iterator[LocatedEvent]
-write_events(events: Iterable[Event], output: str | Path) -> int
-normalize_file(source: str | Path, output: str | Path) -> int
-```
-
 ### Readers and locations
 
-- `iter_raw_events` lazily reads a **completed raw capture** and applies
-  `normalize_record` to each record in memory. It writes nothing and does not
-  modify the capture. There is no tailing or capture-runner behavior; stop capture
-  before reading. Normalization cannot detect mixed runs or prove completeness.
-- `iter_events` lazily reads **normalized v1 only**, validating through
-  `EVENT_ADAPTER`. Readers do not auto-detect or mix formats: raw input to
-  `iter_events`, or normalized input to `iter_raw_events`, is an error.
-- Both readers share one byte-line JSONL parser. Each physical line is decoded
-  with strict UTF-8, so even decoding failures have the correct line number. Blank
-  lines are skipped; empty/blank-only files and valid final records without a
-  trailing newline are accepted.
-- Malformed JSON, non-object records, a UTF-8 BOM, non-finite constants such as
-  `NaN`/`Infinity`, and duplicate keys at any object depth are rejected. Model
-  types/fields/versions are validated by the appropriate Pydantic adapter, not
-  a second handwritten normalized schema.
-- Records stream in file order, retaining incomplete observations and repeated
-  hooks. No association, enrichment, filtering, deduplication, or sorting occurs;
-  file order is not asserted to be a global causal order.
+`iter_raw_events` lazily normalizes a **completed raw capture** in memory without
+writing/modifying it; stop capture first. `iter_events` lazily validates
+**normalized v1 only** through `EVENT_ADAPTER`. No tailing, capture runner, format
+auto-detection/mixing, or completeness/mixed-run detection is supplied.
 
-Each reader yields a frozen `LocatedEvent` dataclass with `event: Event`,
-`path: Path`, and `line: int`. Its `location` property is `f"{path}:{line}"`.
-The line is the one-based **physical input line**, including skipped blanks in
-its count, not the event's optional Go source/debug `line`. Locations name the
-file actually read and are never serialized into the captured event. For the
-same capture, raw reading and normalization followed by normalized reading yield
-equal events in equal order; their paths/physical lines can differ.
+Both share a byte-line parser: strict UTF-8 decoding per physical line, blank
+lines skipped, empty/blank-only files and valid unterminated final records
+accepted. Malformed JSON, non-object records, UTF-8 BOM, `NaN`/`Infinity`, and
+duplicate keys at any depth fail. Model validation belongs to the appropriate
+adapter, not a second handwritten schema. Events stream in file order without
+association/enrichment/filtering/deduplication/sorting; this is not global causal
+order across processes.
 
-`EventFileError(ValueError)` stores `path`, `line`, and `reason`; its string begins
-with `path:line:`. JSON, UTF-8, raw normalization, and Pydantic input failures are
-wrapped with the original exception as `__cause__`. Filesystem failures remain
-`OSError` subclasses; programming errors are not treated as malformed records.
-A reader may already have yielded valid earlier events when a later line fails.
+A frozen `LocatedEvent` carries `event`, `path: Path`, and one-based physical
+`line: int`; `location` is `f"{path}:{line}"`. Skipped blanks count toward lines;
+the Go debug line is separate. Locations name the file actually read and are
+never wire metadata. Raw reading and normalizing then reading yield equal events
+in equal order, but locations can differ.
 
-### Writer and file normalization
+`EventFileError(ValueError)` stores `path`, `line`, `reason`, with a string starting
+`path:line:`. JSON/UTF-8/raw/Pydantic input failures retain their original exception
+as `__cause__`. Filesystem errors remain `OSError` subclasses; programming errors
+are not reclassified as bad records. Earlier valid events may already have been
+yielded when a later line fails.
 
-`write_events` validates every outgoing value through `EVENT_ADAPTER`, including
-model instances created with unchecked Pydantic construction/copy helpers. It
-then serializes the validated model with
-`model_dump_json(by_alias=False, exclude_none=False, ensure_ascii=False)` and one
-final newline. Output contains explicit nulls and literal UTF-8 Unicode, not raw
-dict dumping or reader location metadata. Memory use is bounded per record, not
-per capture. The return value counts events, including repeated hooks.
+### Safe publication
+
+`write_events` revalidates every outgoing value through `EVENT_ADAPTER`, including
+unchecked model instances. It streams
+`model_dump_json(by_alias=False, exclude_none=False, ensure_ascii=False)` plus one
+newline per event: explicit nulls, literal UTF-8 Unicode, no location metadata or
+raw-dict dumping. Memory is bounded per record, not capture; the count includes
+repeated hooks.
 
 Output must be a **new file in an existing directory**. Existing files,
-directories, and symlinks (including dangling symlinks) are never overwritten or
-followed for writing. Output equal to the input is rejected. No append, overwrite,
-parent-directory creation, or raw-file rewrite mode is provided.
+directories, symlinks (including dangling ones), or input-equal output are rejected,
+never overwritten/followed for writing. No append/overwrite, parent creation, or
+raw rewrite mode exists. A same-filesystem temporary is fully validated/written
+and closed before `os.link(temp_path, output_path)` publishes it atomically without
+clobbering a concurrent destination. The existence precheck is only an optimization.
+Temporary names are removed on success/failure; decode/validation/serialization/
+write/close failures before publication leave no output prefix. Unsupported hard
+links raise a filesystem error; there is no overwriting `os.replace` fallback.
+This assumes supported local filesystem semantics, **not crash durability or
+network-filesystem guarantees**.
 
-The writer uses a temporary file on the output filesystem, validates and writes
-the entire stream, closes it, then publishes with `os.link(temp_path,
-output_path)`. This is atomic no-clobber publication: an existence precheck is
-only an optimization, and a destination created by another writer before the
-link is preserved. The temporary name is removed on success or failure. Decode,
-validation, serialization, write, or close failure before publication leaves no
-output file, rather than a success-looking prefix. If hard links are unsupported,
-the filesystem error is reported; there is no `os.replace` fallback that could
-overwrite user data. These guarantees assume a supported local filesystem and
-are not crash-durability or network-filesystem guarantees.
+`normalize_file` composes the raw reader and writer with no extra mapping/error
+wrapping: `write_events((record.event for record in iter_raw_events(source)), output)`.
+Empty input publishes empty output and returns zero, not evidence of useful traffic.
 
-`normalize_file` is exactly `write_events((record.event for record in
-iter_raw_events(source)), output)`: it has no separate normalization or error
-wrapping logic. Empty input publishes a valid empty output with count zero;
-that is not evidence of useful instrumented traffic.
-
-## Command line
+## CLI
 
 ```text
 contexttrack normalize INPUT --output NEW_OUTPUT
-contexttrack schema
 python -m contexttrack normalize INPUT --output NEW_OUTPUT
+contexttrack schema
 ```
 
-The installed console command and module command share
-[`contexttrack.cli.main(argv: Sequence[str] | None = None) -> int`](src/contexttrack/cli.py).
-The CLI delegates normalization to `normalize_file`; it has no separate field
-mapping, validation, or request-association logic. `normalize` accepts completed
-**raw captures only**, never normalized data or mixed/auto-detected formats.
-There are no default paths, append/overwrite flag, lenient/skip-bad option, or
-stdout-output mode. The existing-directory, new-file and atomic-publication
-rules above apply unchanged.
-
-Successful normalization returns 0 with empty stdout/stderr. Expected input or
-filesystem failures return 2 with a useful stderr diagnostic and no traceback;
-input diagnostics retain the raw path and physical line. Argument errors use
-argparse's stderr diagnostics and exit 2. Help exits 0.
+Both entry points use [`cli.main(argv: Sequence[str] | None = None) -> int`](src/contexttrack/cli.py).
+`normalize` delegates to `normalize_file` and accepts completed **raw only**.
+There are no default paths, append/overwrite/skip-bad flags, stdout-output mode,
+or separate mapping/association logic. The publication rules above apply.
+Success returns 0 with empty stdout/stderr; expected input/filesystem failures
+return 2 with stderr diagnostics and no traceback (input retains path/physical
+line). Argparse argument errors exit 2; help exits 0.
 
 `schema` prints `EVENT_ADAPTER.json_schema()` as sorted, two-space-indented UTF-8
-JSON with a final newline and no other stdout content. It works from the
-installed package without a checkout or schema snapshot. Package version
-`0.2.0` and normalized schema version `1` are independent; no registry
-publication or downstream consumer migration is implied.
+JSON with a final newline, no other stdout, and no required checkout/snapshot.
+No registry publication or consumer adoption is implied.
 
 ## Public Python API
 
-`contexttrack.models` and the package root export `ContextInfo`, `RequestFields`,
-`RequestMessage`, `SentRequestMessage`, `RoutedRequestMessage`, `ResponseMessage`,
-all five concrete event classes, `Event`, and `EVENT_ADAPTER`. The package root
-also exports `normalize_record` and all documented `contexttrack.io` interfaces:
-`LocatedEvent`, `EventFileError`, `iter_raw_events`, `iter_events`, `write_events`,
-and `normalize_file`. Importing the package root does not import the CLI.
+These are package-root exports and the identical objects in the named submodule:
 
-`Event` is an `Annotated` discriminated union, not a class with
-`model_validate_json`. Use `EVENT_ADAPTER` or a concrete event model:
+| Submodule | Public names / signatures | Role |
+| --- | --- | --- |
+| `contexttrack.models` | `ContextInfo`, `RequestFields`, `RequestMessage`, `SentRequestMessage`, `RoutedRequestMessage`, `ResponseMessage` | Context/payload models tabulated above |
+| `contexttrack.models` | `RequestSent`, `RequestReceived`, `RequestRouted`, `ResponseSent`, `ResponseReceived` | Concrete event models tabulated above |
+| `contexttrack.models` | `Event`, `EVENT_ADAPTER: TypeAdapter[Event]` | `Annotated` kind-discriminated union and validator |
+| `contexttrack.normalize` | `normalize_record(record: object) -> Event` | Pure single-raw-record conversion |
+| `contexttrack.io` | `LocatedEvent`, `EventFileError` | Frozen location wrapper / located input error |
+| `contexttrack.io` | `iter_raw_events(path: str \| Path) -> Iterator[LocatedEvent]` | Raw reader |
+| `contexttrack.io` | `iter_events(path: str \| Path) -> Iterator[LocatedEvent]` | Normalized reader |
+| `contexttrack.io` | `write_events(events: Iterable[Event], output: str \| Path) -> int` | Safe writer; event count |
+| `contexttrack.io` | `normalize_file(source: str \| Path, output: str \| Path) -> int` | Raw-file conversion; event count |
+
+Importing the package does not import the CLI/graph code, inspect capture
+environment variables, emit diagnostics, open captures, or require Go/consumer
+repositories. `Event` is not a class with `model_validate_json`; use the adapter
+or a concrete model:
 
 ```python
-from contexttrack.models import EVENT_ADAPTER, RequestSent
+from contexttrack import EVENT_ADAPTER, RequestSent
 
 record = {
-    "schema_version": 1,
-    "kind": "send_request",
-    "pid": 42,
+    "schema_version": 1, "kind": "send_request", "pid": 42,
     "context": {"context_id": "id:7"},
     "message": {"method": "gEt", "host": "Höst:80", "path": "/", "raw_query": ""},
 }
 event = EVENT_ADAPTER.validate_python(record)
 assert isinstance(event, RequestSent)
 assert event.context_key == (42, "id:7")
-
 text = event.model_dump_json(by_alias=False, exclude_none=False, ensure_ascii=False)
 assert EVENT_ADAPTER.validate_json(text) == event
 ```
 
-For raw input, import the record normalizer; no graph code or other records are
-needed, even for an incomplete response:
+Raw conversion needs neither graph code nor other records:
 
 ```python
-from contexttrack.models import ResponseReceived
-from contexttrack.normalize import normalize_record
+from contexttrack import ResponseReceived, normalize_record
 
 event = normalize_record({
-    "kind": "Response received",
-    "pid": 42,
-    "message": {"resp.StatusCode": "0200"},
+    "kind": "Response received", "pid": 42, "message": {"resp.StatusCode": "0200"},
 })
 assert isinstance(event, ResponseReceived)
 assert event.message.status_code == 200
-assert event.message.path is None
-assert event.api_id is None
+assert event.message.path is None and event.api_id is None
 assert event.context_key is None
 ```
 
-For file-based use, import the I/O API from `contexttrack.io`; raw and normalized
-files have explicit, separate entry points:
+File use (provide a completed raw input and a new output):
 
 ```python
-from contexttrack.io import iter_events, iter_raw_events, normalize_file
+from contexttrack import iter_events, iter_raw_events, normalize_file
 
 for record in iter_raw_events("raw.jsonl"):
     print(record.location, record.event.kind, record.event.context_key)
-
 count = normalize_file("raw.jsonl", "new-normalized.jsonl")
 for record in iter_events("new-normalized.jsonl"):
     print(record.location, record.event.kind, record.event.context_key)
 ```
 
-Serialization includes all nullable fields as explicit nulls, preserves Unicode,
-and excludes `context_key`. Use `write_events` for safe JSONL publication; add a
-newline when serializing an individual record yourself.
-`EVENT_ADAPTER.json_schema()` provides the schema derived from these same models;
-there is no independently maintained normalized validator.
+Single-record serialization excludes `context_key` and needs a newline for JSONL;
+use `write_events` for safe publication. Direct `EVENT_ADAPTER.validate_json`
+checks model shape, **not** the readers' extra file-level checks.
 
-Imports do not read capture environment variables, emit diagnostics, open
-captures, import graph code, or require Go or the consumer repository. The
-package includes `py.typed` and requires Python >=3.14 and Pydantic >=2.13.5,<3.
+## Generated JSON Schema
 
-## Published JSON Schema
-
-[`schemas/contexttrack-event-v1.schema.json`](schemas/contexttrack-event-v1.schema.json)
-is the sorted, indented snapshot of `EVENT_ADAPTER.json_schema()`, not an
-independent handwritten validator. It describes one normalized event object,
-not an entire JSONL file. Generate it and check for model/snapshot drift with:
+There is **no checked-in schema snapshot** or independently maintained validator.
+`EVENT_ADAPTER.json_schema()` describes one normalized object, not a JSONL file.
+Export to a new scratch path and verify CLI/model agreement:
 
 ```bash
-uv run contexttrack schema > schemas/contexttrack-event-v1.schema.json
+SCHEMA_DIR=$(mktemp -d /tmp/contexttrack-schema.XXXXXX)
+uv run contexttrack schema > "$SCHEMA_DIR/event-v1.schema.json"
 uv run pytest -q tests/test_schema.py
 ```
 
-Do not edit the snapshot by hand. The installed `contexttrack schema` command
-exports the same model-derived schema without needing this checkout. Model
-changes require schema review and regeneration; incompatible fields, kinds, or
-meanings require an explicitly supported format version. A package release does
-not by itself introduce a new schema version.
-
-JSON Schema alone does not supply the file reader's duplicate-key, UTF-8, BOM,
-and physical-line checks, or all Python strict-type checks. For example, JSON
-Schema's integer semantics can treat `1.0` as integral, while the public models
-reject it as `schema_version`. Use the documented readers and Pydantic adapter
-as the Python validation boundary, not the snapshot as a replacement reader.
+The installed command works without a checkout. Changes require schema review;
+incompatible fields/kinds/meanings and schema additions require an explicitly
+supported format version, not just a package release. Do not hand-maintain another
+validator. JSON Schema does not provide duplicate-key/UTF-8/BOM/physical-line
+checks or every Python strict-type rule: it can treat `1.0` as an integer whereas
+the public models reject it as `schema_version`. Readers/adapter remain the Python
+validation boundary. CLI formatting is owned by `tests/test_cli.py`; independent
+literal model tests are not replaced by generation agreement.
 
 ## Consumer handoff: separately authorized work
 
-The reference consumer is `conftamer-cli/node-query` at
-`a173121d6cec1ebf26394714c356a0eaa17149fa`. It has **not** been migrated to this
-package or to normalized files. It still parses raw captures itself and builds
-a message-only PMGraph. Its caller supplies `module_id`; it does not implement
-parameter ingestion, cross-module stitching, or full AppGraph composition.
-The [implementation plan, Section 7](docs/superpowers/plans/2026-09-27-contexttrack-normalized-events.md#7-separately-authorized-node-query-handoff)
-records the separately authorized migration and its test gate:
+Reference: `conftamer-cli/node-query` at
+`a173121d6cec1ebf26394714c356a0eaa17149fa`, inspected from committed README,
+importer, and tests. It **has not migrated**: it parses raw itself and builds a
+message-only PMGraph with caller-supplied `module_id`. Its build needs `--module-id`
+and a new `--output`; export emits GraphML, query uses exact PMGraph node IDs.
+Parameter ingestion, stitching, and full AppGraph composition are unimplemented.
+A separately authorized migration must:
 
-1. Pin a tested ContextTrack artifact/version in the consumer's dependency
-   manifest and lockfile. Import the public models and `iter_raw_events`; do not
-   copy the schema/models or retain a second consumer-owned raw parser.
+1. Pin a tested ContextTrack artifact/version in the dependency manifest/lockfile.
+   Import public models and `iter_raw_events`, without copying models/schema or
+   keeping a second consumer-owned raw parser.
 2. Keep `load_contexttrack(path, *, module_id)` and
-   `conftamer build INPUT --module-id ID --output NEW` on **one completed raw
-   input path**. Do not add format auto-detection, an input-format option, a
-   second reader, or a required normalization pre-step. Support for normalized
-   consumer input is not part of this handoff.
-3. Adapt each `LocatedEvent` to the consumer's internal mutable association
-   record, retaining `record.location`, `event.context_key`, typed payload
-   fields, and canonical kind names. Public event models remain immutable.
-   Responses have no host field; association must not pretend one was captured.
-4. Keep the conservative association algorithm: a route or response needs a
-   unique earlier request with matching `(pid, context_id)`, method, and
-   concrete path. Rewritten/ambiguous routes warn and fall back to the concrete
-   path; unmatched/ambiguous responses warn and are omitted. API IDs never
-   become module IDs. Occurrence handling, label interning, and influence edges
-   remain consumer responsibilities.
-5. Explicitly document the stricter raw-input validation. Unknown kinds/keys,
-   per-kind forbidden message fields, explicit null string labels, non-null
-   `request_id` outside `Request sent`, `context.root_addr`, duplicate JSON
-   keys, and a UTF-8 BOM become errors rather than tolerated/warned-about input.
-   Malformed input surfaces as `EventFileError`, a `ValueError`, with
-   `path:physical-line`; the legacy `TypeError`/`ValueError` split disappears.
-   Expected CLI input errors still exit 2. Incomplete but well-typed evidence
-   remains available for downstream warnings/omissions.
-6. Verify the migrated consumer in an authorized disposable checkout using its
-   importer/CLI tests and a build of the committed raw fixture into a new
-   PMGraph file. Its expected four scrape nodes and edge `{("n1", "n2")}` are
-   graph results, **not** the normalizer's record count: normalization retains
-   all 20 fixture records, including eight received-response hooks.
+   `conftamer build INPUT --module-id ID --output NEW` on **one completed raw path**.
+   No auto-detection, input-format option, second reader, normalized-input support,
+   or required normalization pre-step belongs to this handoff.
+3. Adapt `LocatedEvent` to the consumer's mutable association record, preserving
+   location, `context_key`, typed payloads, and canonical kinds; public events stay
+   immutable. Do not pretend responses captured a host.
+4. Preserve conservative association: routes/responses need a unique earlier
+   appropriate request matching `(pid, context_id)`, method, concrete path.
+   Rewritten/ambiguous routes warn and fall back to concrete path; unmatched/
+   ambiguous responses warn and are omitted. Retain conflicting-API-ID rejection;
+   API IDs never become module IDs. Occurrences, label interning, and influence
+   edges remain consumer responsibilities.
+5. Document stricter raw validation: unknown kinds/keys, forbidden per-kind fields,
+   explicit null string labels, non-null `request_id` outside sends, `root_addr`,
+   duplicate keys, and BOM become errors instead of tolerated/warned input.
+   Malformed input becomes `EventFileError` (`ValueError`) with `path:physical-line`,
+   replacing the legacy `TypeError`/`ValueError` split; expected CLI errors still
+   exit 2. Incomplete well-typed evidence remains for warnings/omissions.
+6. Verify importer/CLI tests and a build of the committed raw fixture to a new
+   PMGraph in an authorized disposable checkout. Expected four scrape nodes and
+   edge `{("n1", "n2")}` are **graph results**, not normalized record counts:
+   all 20 fixture records, including eight received-response hooks, are retained.
 
-No consumer edits, registry publication, or adoption proof are implied by the
-producer's wheel and capture checks. The standard-library-only `analysis/`
-scripts also stay on raw input; their co-occurrence graphs are diagnostic views,
-not canonical PMGraphs or proofs of causality.
+Producer wheel/capture checks imply no consumer edits, registry publication, or
+adoption proof. Standard-library-only raw-analysis co-occurrence views are
+not canonical PMGraphs or causality proofs.
 
 ## Privacy, trust boundaries, and human audit
 
-Normalized output can retain raw query strings, context diagnostics, endpoint
-labels, handler names, and source paths. These can disclose credentials or
-other sensitive/environment-specific information. This release is **not a
-redaction mechanism**. Keep the original capture for auditing, protect both
-files appropriately, and do not commit real captures or generated graphs.
-Valid JSONL, successful normalization, and even a nonempty capture do not prove
-capture completeness, successful HTTP delivery, or correct influence attribution.
+Raw query strings, context diagnostics, endpoint labels, handlers, and source
+paths may expose credentials or environment-specific data. Normalization is
+**not redaction**.
+Retain original evidence for auditing, protect both files, and do not commit real
+captures/graphs. Valid JSONL, successful normalization, or nonempty captures do
+not prove completeness, HTTP delivery, or correct influence attribution.
 
-Python and Pydantic (including pydantic-core and typing dependencies), the Go
-toolchain/standard library that produces raw evidence, uv/uv_build, pytest, and
-type/lint/format/build tooling are external trust boundaries. Dependency
-manifests, lock metadata/hashes, and artifact checks are project review inputs;
-they are **not an audit of third-party source**. Filesystem publication relies
-on the local hard-link behavior described above. The paper defines the intended
-PMGraph/AppGraph design; producer and consumer tests cover only their stated
-prototype boundaries.
+Python/Pydantic (including pydantic-core/typing dependencies), Go/stdlib, uv/
+uv_build, pytest, and type/lint/format/build tools are external trust boundaries.
+Manifests, lock metadata/hashes, and artifact checks are review inputs, **not
+third-party source audits**. Filesystem limits are stated under safe publication;
+paper semantics and prototype-test boundaries are distinct.
 
-The [Task 5 handoff](docs/contexttrack-normalized-events-task5.md) records exact
-commands/results, outstanding findings, and a complete-project file inventory.
-Human review must cover existing and new source, Go hooks/patches, tests,
-tooling, documentation (including the plan), generated schema, and packaging/
-lock metadata against the final revision or recorded file hashes. Every file's
-human review status and actual sign-off remain **pending** until humans perform
-that audit and resolve findings; automated checks and agent review cannot
-satisfy this gate.
+Complete-project human audit/sign-off remains **pending** until humans review
+existing/new source, Go hooks/patches, tests, tooling, active documentation and
+plans, generated schema output, packaging/lock metadata against the final revision
+or recorded hashes, record every file's status, and resolve findings. Automated
+checks and agent review do not satisfy that gate.

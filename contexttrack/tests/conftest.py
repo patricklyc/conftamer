@@ -1,6 +1,39 @@
 """Synthetic raw captures and normalized event fixtures."""
 
+import json
+from pathlib import Path
+
 import pytest
+
+from contexttrack.models import EVENT_ADAPTER, RequestSent
+from contexttrack.normalize import normalize_record
+
+
+@pytest.fixture(params=["raw", "normalized"])
+def boundary(request, raw_sent, normalized_sent):
+    if request.param == "raw":
+        return normalize_record, raw_sent
+    return EVENT_ADAPTER.validate_python, normalized_sent
+
+
+@pytest.fixture
+def write_jsonl(tmp_path):
+    def write(*records: object, name: str = "input.jsonl") -> Path:
+        path = tmp_path / name
+        path.write_text(
+            "".join(json.dumps(value, ensure_ascii=False) + "\n" for value in records),
+            encoding="utf-8",
+        )
+        return path
+
+    return write
+
+
+@pytest.fixture
+def event(normalized_sent):
+    value = EVENT_ADAPTER.validate_python(normalized_sent)
+    assert isinstance(value, RequestSent)
+    return value
 
 
 @pytest.fixture
