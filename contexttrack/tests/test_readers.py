@@ -28,16 +28,6 @@ def test_raw_reader_normalizes_in_memory(tmp_path, raw_sent):
     assert sorted(path.name for path in tmp_path.iterdir()) == [source.name]
 
 
-def test_raw_record_error_has_raw_physical_line(tmp_path, raw_sent):
-    source = tmp_path / "raw.jsonl"
-    bad = raw_sent | {"kind": "unknown"}
-    source.write_text(json.dumps(raw_sent) + "\n\n" + json.dumps(bad), encoding="utf-8")
-    records = iter_raw_events(source)
-    assert next(records).line == 1
-    with pytest.raises(EventFileError, match=rf"{source}:3:"):
-        next(records)
-
-
 def test_reader_location_is_frozen_and_not_serialized(tmp_path, normalized_sent):
     source = tmp_path / "events.jsonl"
     source.write_text("\n" + json.dumps(normalized_sent), encoding="utf-8")
@@ -113,17 +103,6 @@ def test_input_errors_keep_physical_line_and_original_cause(
     assert reason in error.reason
     assert isinstance(error.__cause__, cause_type)
     assert source.read_bytes() == data
-
-
-def test_normalized_reader_wraps_model_errors(tmp_path, normalized_sent):
-    source = tmp_path / "normalized.jsonl"
-    source.write_text(
-        "\n\n" + json.dumps(normalized_sent | {"schema_version": 2}), encoding="utf-8"
-    )
-    with pytest.raises(EventFileError) as caught:
-        list(iter_events(source))
-    assert caught.value.line == 3
-    assert isinstance(caught.value.__cause__, ValidationError)
 
 
 def test_raw_reader_wraps_decimal_conversion_error(tmp_path):

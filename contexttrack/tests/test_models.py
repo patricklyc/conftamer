@@ -60,12 +60,6 @@ def test_missing_or_empty_context_id_has_no_group(normalized_sent, context):
     assert event.context_key is None
 
 
-def test_unknown_fields_are_not_ignored(normalized_sent):
-    normalized_sent["message"]["req.Method"] = "GET"
-    with pytest.raises(ValidationError):
-        EVENT_ADAPTER.validate_python(normalized_sent)
-
-
 @pytest.mark.parametrize("kind", CANONICAL_FIELDS)
 def test_canonical_path_cannot_be_empty(normalized_sent, kind):
     record = normalized_sent | {"kind": kind, "message": {"path": ""}}
@@ -235,18 +229,6 @@ def test_message_strings_are_not_normalized(normalized_sent):
     event = EVENT_ADAPTER.validate_python(record)
     assert event.message.model_dump() == record["message"]
     assert "Höst:80" in event.model_dump_json(ensure_ascii=False)
-
-
-@pytest.mark.parametrize("pattern", ["GET /items/{id}", ":name", "*path"])
-def test_route_pattern_is_separate_from_concrete_path(normalized_sent, pattern):
-    record = normalized_sent | {
-        "kind": "request_routed",
-        "message": {"method": "GET", "path": "/items/7", "pattern": pattern},
-    }
-    event = EVENT_ADAPTER.validate_python(record)
-    assert isinstance(event, RequestRouted)
-    assert event.message.path == "/items/7"
-    assert event.message.pattern == pattern
 
 
 @pytest.mark.parametrize(

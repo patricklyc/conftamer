@@ -12,27 +12,32 @@ import (
 	"time"
 )
 
-func TestClientDoCancelRequest(t *testing.T) {
-	s := server(t, false, "/client-cancel", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "1")
-		w.WriteHeader(200)
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", s.URL+"/client-cancel", nil)
-	if err != nil {
-		t.Fatal(err)
+func TestTransportCancelRequest(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		t.Run(fmt.Sprintf("direct=%v", direct), func(t *testing.T) {
+			path := fmt.Sprintf("/cancel/%v", direct)
+			s := server(t, false, path, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "1")
+				w.WriteHeader(200)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, "GET", s.URL+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := send(s.Client(), req, direct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			// Cancel after RoundTrip has returned, while the response body is in flight.
+			s.Client().Transport.(*http.Transport).CancelRequest(req)
+			assertBodyInterrupted(t, resp.Body, cancel)
+		})
 	}
-	resp, err := s.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	// Cancel after RoundTrip has returned, while the response body is in flight.
-	s.Client().Transport.(*http.Transport).CancelRequest(req)
-	assertBodyInterrupted(t, resp.Body, cancel)
 }
 
 // The legacy Request.Cancel channel must still reach the sent request.

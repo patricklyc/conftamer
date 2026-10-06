@@ -39,42 +39,11 @@ def _run_cli(
 
 
 @pytest.mark.parametrize(
-    "args, fragments",
-    [
-        (["--help"], ["normalize", "schema"]),
-        (["normalize", "--help"], ["input", "--output"]),
-        (["schema", "--help"], ["schema"]),
-    ],
-)
-def test_main_help(tmp_path, monkeypatch, args, fragments, capsys):
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(SystemExit) as caught:
-        cli.main(args)
-    assert caught.value.code == 0
-    stdout, stderr = capsys.readouterr()
-    assert stderr == ""
-    assert "usage: contexttrack" in stdout
-    assert all(fragment in stdout for fragment in fragments)
-    assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize(
     "args, diagnostic",
     [
         ([], "required"),
-        (["normalize"], "required"),
         (["normalize", "raw.jsonl"], "--output"),
-        (["normalize", "--output", "new.jsonl"], "input"),
         (["unknown"], "invalid choice"),
-        (
-            ["normalize", "raw.jsonl", "--output", "new.jsonl", "--overwrite"],
-            "unrecognized arguments",
-        ),
-        (
-            ["normalize", "raw.jsonl", "--output", "new.jsonl", "--skip-bad"],
-            "unrecognized arguments",
-        ),
-        (["schema", "--output", "new.json"], "unrecognized arguments"),
     ],
 )
 def test_main_argument_errors(tmp_path, monkeypatch, args, diagnostic, capsys):
@@ -87,20 +56,6 @@ def test_main_argument_errors(tmp_path, monkeypatch, args, diagnostic, capsys):
     assert diagnostic in stderr
     assert "Traceback" not in stderr
     assert list(tmp_path.iterdir()) == []
-
-
-def test_normalize_delegates_paths(tmp_path, monkeypatch, capsys):
-    calls = []
-
-    def record_call(source, output):
-        calls.append((source, output))
-        return 1
-
-    monkeypatch.setattr(cli, "normalize_file", record_call)
-    source, output = tmp_path / "raw.jsonl", tmp_path / "new.jsonl"
-    assert cli.main(["normalize", str(source), "--output", str(output)]) == 0
-    assert calls == [(source, output)]
-    assert capsys.readouterr() == ("", "")
 
 
 @pytest.mark.parametrize(

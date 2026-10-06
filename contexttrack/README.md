@@ -168,10 +168,10 @@ From `contexttrack/` in the installed development environment:
 ```bash
 uv sync --locked --dev
 uv run pytest -q
-uv run pytest -q tests/test_schema.py tests/test_cli.py tests/test_api.py
+uv run pytest -q tests/test_cli.py tests/test_api.py
 ```
 
-The schema test compares public CLI output with `EVENT_ADAPTER.json_schema()`;
+The CLI tests compare public schema output with `EVENT_ADAPTER.json_schema()`;
 there is **no checked-in snapshot**. Export to a fresh scratch destination with
 [these generation instructions](OUTPUT.md#generated-json-schema). Independent
 model/normalization tests own literal field expectations, not schema introspection.
@@ -183,7 +183,7 @@ unchanged standard-library tooling tests from ty/Ruff:
 PYTHON_SCOPE=(
   src/contexttrack tests/conftest.py tests/test_validation.py tests/test_models.py
   tests/test_normalize.py tests/test_readers.py tests/test_writers.py
-  tests/test_roundtrip.py tests/test_api.py tests/test_cli.py tests/test_schema.py
+  tests/test_roundtrip.py tests/test_api.py tests/test_cli.py
 )
 uvx ty check "${PYTHON_SCOPE[@]}"
 uvx ruff check "${PYTHON_SCOPE[@]}"

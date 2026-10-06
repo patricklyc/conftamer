@@ -483,29 +483,6 @@ func TestRequestOwnership(t *testing.T) {
 	}
 }
 
-func TestTransportCancelRequest(t *testing.T) {
-	s := server(t, false, "/cancel", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "1")
-		w.WriteHeader(200)
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", s.URL+"/cancel", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	transport := s.Client().Transport.(*http.Transport)
-	resp, err := transport.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	transport.CancelRequest(req)
-	assertBodyInterrupted(t, resp.Body, cancel)
-}
-
 func TestTracingDisabled(t *testing.T) {
 	capture := os.Getenv("CONFTAMER_EVENTS")
 	before, err := os.Stat(capture)
@@ -516,7 +493,7 @@ func TestTracingDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(executable, "-test.run=^Test(RequestOwnership|ClientDoCancelRequest|ClientDoLegacyCancel|CallerRequestIdentity|CheckRedirectRequestIdentity|ClientNativeCopies|TransportWrapperCopies|RoundTripperReturnsRequest|RedirectWithClientTimeout|BodyRequestCapture)$", "-test.count=1")
+	cmd := exec.Command(executable, "-test.run=^Test(RequestOwnership|TransportCancelRequest|ClientDoLegacyCancel|CallerRequestIdentity|CheckRedirectRequestIdentity|ClientNativeCopies|TransportWrapperCopies|RoundTripperReturnsRequest|RedirectWithClientTimeout|BodyRequestCapture)$", "-test.count=1")
 	for _, item := range os.Environ() {
 		if !strings.HasPrefix(item, "CONFTAMER_EVENTS=") {
 			cmd.Env = append(cmd.Env, item)

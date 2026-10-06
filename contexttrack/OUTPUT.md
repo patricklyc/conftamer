@@ -335,7 +335,7 @@ Export to a new scratch path and verify CLI/model agreement:
 ```bash
 SCHEMA_DIR=$(mktemp -d /tmp/contexttrack-schema.XXXXXX)
 uv run contexttrack schema > "$SCHEMA_DIR/event-v1.schema.json"
-uv run pytest -q tests/test_schema.py
+uv run pytest -q tests/test_cli.py -k schema
 ```
 
 The installed command works without a checkout. Changes require schema review;
