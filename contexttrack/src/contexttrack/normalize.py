@@ -1,16 +1,24 @@
 """Pure, record-local conversion from raw capture data to normalized v1 events."""
 
 from contexttrack._raw import RawContext, RawEvent, RawRequestID
-from contexttrack.models import EVENT_ADAPTER, Event
+from contexttrack.models import (
+    EVENT_ADAPTER,
+    Event,
+    RequestFields,
+    RequestMessage,
+    ResponseMessage,
+    RoutedRequestMessage,
+    SentRequestMessage,
+)
 
 __all__ = ["normalize_record"]
 
 
-def _path(value: str | None) -> str | None:
+def _normalize_path(value: str | None) -> str | None:
     return "/" if value == "" else value
 
 
-def _status(value: str | None) -> int | None:
+def _parse_status_code(value: str | None) -> int | None:
     if value is None:
         return None
     if not value.isdecimal():
@@ -26,31 +34,46 @@ def normalize_record(record: object) -> Event:
     """
     raw = RawEvent.model_validate(record)
     message = raw.message
-    # Outbound endpoint labels come only from request_id, never from message.
-    if raw.kind == "Request sent":
-        labels = raw.request_id if raw.request_id is not None else RawRequestID()
-    else:
-        labels = message
-    normalized_message: dict[str, object] = {
-        "method": labels.method,
-        "path": _path(labels.path),
-    }
+    normalized_message: RequestFields
     match raw.kind:
         case "Request sent":
             kind = "send_request"
-            normalized_message.update(host=labels.host, raw_query=message.raw_query)
+            # Endpoint labels come only from request_id, never from message.
+            endpoint = raw.request_id if raw.request_id is not None else RawRequestID()
+            normalized_message = SentRequestMessage(
+                method=endpoint.method,
+                path=_normalize_path(endpoint.path),
+                host=endpoint.host,
+                raw_query=message.raw_query,
+            )
         case "Request received":
             kind = "receive_request"
-            normalized_message["raw_query"] = message.raw_query
+            normalized_message = RequestMessage(
+                method=message.method,
+                path=_normalize_path(message.path),
+                raw_query=message.raw_query,
+            )
         case "Request routed":
             kind = "request_routed"
-            normalized_message["pattern"] = message.pattern
+            normalized_message = RoutedRequestMessage(
+                method=message.method,
+                path=_normalize_path(message.path),
+                pattern=message.pattern,
+            )
         case "Response sent":
             kind = "send_response"
-            normalized_message["status_code"] = _status(message.code)
+            normalized_message = ResponseMessage(
+                method=message.method,
+                path=_normalize_path(message.path),
+                status_code=_parse_status_code(message.code),
+            )
         case "Response received":
             kind = "receive_response"
-            normalized_message["status_code"] = _status(message.status_code)
+            normalized_message = ResponseMessage(
+                method=message.method,
+                path=_normalize_path(message.path),
+                status_code=_parse_status_code(message.status_code),
+            )
     payload = raw.model_dump(exclude={"kind", "message", "context", "request_id"})
     payload.update(
         schema_version=1,

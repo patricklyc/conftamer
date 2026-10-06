@@ -170,6 +170,24 @@ class ToolingTest(unittest.TestCase):
         self.assertEqual(self.cache_entries(), [], "failed build left cache entries")
         self.assertEqual((root / "src/net/http/client.go").read_text(), "package http\n")
 
+    def test_overlay_preparation_failure_installs_nothing(self):
+        utilities = self.tmp / "utilities"
+        utilities.mkdir()
+        chmod = utilities / "chmod"
+        chmod.write_text("#!/bin/sh\nprintf 'simulated chmod failure\\n' >&2\nexit 1\n")
+        chmod.chmod(0o755)
+        out = self.run_cmd(
+            [SETUP, "-q"],
+            check=False,
+            PATH=f"{utilities}{os.pathsep}{os.environ['PATH']}",
+        )
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(out.stdout, "")
+        self.assertIn("simulated chmod failure", out.stderr)
+        self.assertEqual(
+            self.cache_entries(), [], "failed preparation installed a cache entry"
+        )
+
     def test_clone_refuses_existing_destination(self):
         dest = self.tmp / "exists"
         dest.mkdir()

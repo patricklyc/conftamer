@@ -427,8 +427,11 @@ func conftamerLogResponseReceived(req *Request, resp *Response, ctx context.Cont
 // Mirror those checks only when no alternate protocol can take the request first:
 // a cached HTTP/2 connection can try methods that the HTTP/1 path rejects.
 func (t *Transport) conftamerWillReject(req *Request, isHTTP bool) bool {
-	return t.alternateRoundTripper(req) == nil &&
-		(!isHTTP || req.Method != "" && !validMethod(req.Method) || req.URL.Host == "")
+	if t.alternateRoundTripper(req) != nil {
+		return false
+	}
+	invalidMethod := req.Method != "" && !validMethod(req.Method)
+	return !isHTTP || invalidMethod || req.URL.Host == ""
 }
 
 // Record patterns during routing: receipt is too early, and nested muxes may

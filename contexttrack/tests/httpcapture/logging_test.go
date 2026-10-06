@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	captureLoggingChild = "CONTEXTTRACK_CAPTURE_LOGGING_CHILD"
-	captureLoggingFile  = "CONTEXTTRACK_CAPTURE_LOGGING_FILE"
+	captureLoggingChild              = "CONTEXTTRACK_CAPTURE_LOGGING_CHILD"
+	captureLoggingFile               = "CONTEXTTRACK_CAPTURE_LOGGING_FILE"
+	captureLoggingConcurrentRequests = 16
 )
 
 func checkCapture(t *testing.T, err error) {
@@ -44,7 +45,7 @@ func requireDevFull(t *testing.T) {
 func TestCaptureWriteFailure(t *testing.T) {
 	requireDevFull(t)
 	capture := "/dev/full"
-	_, stderr := runCaptureLoggingChildMode(t, &capture, "1", "")
+	_, stderr := runCaptureLoggingChildMode(t, &capture, "normal", "")
 	startup, warning, _ := strings.Cut(stderr, "\n")
 	pattern := regexp.MustCompile(`^conftamer: capture write failed for "/dev/full": .+; capture may be incomplete or invalid\n$`)
 	if startup != `conftamer: enabled — writing "/dev/full"` || !pattern.MatchString(warning) {
@@ -105,7 +106,7 @@ func TestCaptureLoggingControls(t *testing.T) {
 			case "open-failure":
 				path = filepath.Join(filepath.Dir(path), "missing", "events.jsonl")
 			}
-			_, stderr := runCaptureLoggingChildMode(t, capture, "1", "")
+			_, stderr := runCaptureLoggingChildMode(t, capture, "normal", "")
 			switch name {
 			case "healthy":
 				if want := fmt.Sprintf("conftamer: enabled — writing %q\n", *capture); stderr != want {
@@ -118,9 +119,14 @@ func TestCaptureLoggingControls(t *testing.T) {
 					}
 					kinds[e.Kind]++
 				}
+				// The final request follows the concurrent batch.
+				requests := captureLoggingConcurrentRequests + 1
 				want := map[string]int{
-					"Request sent": 17, "Request received": 17, "Request routed": 17,
-					"Response sent": 17, "Response received": 34,
+					"Request sent":      requests,
+					"Request received":  requests,
+					"Request routed":    requests,
+					"Response sent":     requests,
+					"Response received": 2 * requests, // Client and wire hooks.
 				}
 				if !maps.Equal(kinds, want) {
 					t.Errorf("event counts = %v, want %v", kinds, want)
@@ -186,42 +192,60 @@ func runCaptureLoggingChildMode(t *testing.T, capture *string, mode, path string
 func TestCaptureLoggingChild(t *testing.T) {
 	mode := os.Getenv(captureLoggingChild)
 	switch mode {
-	case "1", "broken-stderr", "closed-stderr", "redirected-stderr":
+	case "normal", "pipe-stderr", "closed-stderr", "redirected-stderr":
 	default:
 		t.Skip("subprocess helper")
 	}
-	if mode == "broken-stderr" {
+	prepareCaptureStderr(t, mode)
+	runCaptureHTTPWorkload(t)
+	if os.Getenv("CONFTAMER_EVENTS") == "/dev/full" && (mode == "normal" || mode == "redirected-stderr") {
+		waitForCaptureWarning(t, os.Getenv(captureLoggingFile))
+	}
+	if mode != "normal" && !t.Failed() {
+		fmt.Fprintln(os.Stdout, "HTTP completed with 204")
+	}
+}
+
+func prepareCaptureStderr(t *testing.T, mode string) {
+	t.Helper()
+	if mode == "pipe-stderr" {
 		fmt.Fprintln(os.Stdout, "ready")
 		var release [1]byte
 		if _, err := io.ReadFull(os.Stdin, release[:]); err != nil || release[0] != '\n' {
 			t.Fatalf("HTTP release handshake failed: %v", err)
 		}
 	}
-	if mode == "closed-stderr" || mode == "redirected-stderr" {
-		originalStderr := os.Stderr
-		if mode == "closed-stderr" {
-			checkCapture(t, originalStderr.Close())
-		}
-		file, err := os.OpenFile(os.Getenv(captureLoggingFile), os.O_WRONLY|os.O_APPEND, 0o600)
-		checkCapture(t, err)
-		defer file.Close()
-		if mode == "closed-stderr" {
-			if fd := file.Fd(); fd != 2 {
-				t.Fatalf("application file descriptor = %d, want reused fd 2", fd)
-			}
-			fmt.Fprintln(os.Stdout, "application file reused fd 2")
-		} else {
-			os.Stderr = file
-			defer func() { os.Stderr = originalStderr }()
-		}
+	if mode != "closed-stderr" && mode != "redirected-stderr" {
+		return
 	}
+	originalStderr := os.Stderr
+	if mode == "closed-stderr" {
+		checkCapture(t, originalStderr.Close())
+	}
+	file, err := os.OpenFile(os.Getenv(captureLoggingFile), os.O_WRONLY|os.O_APPEND, 0o600)
+	checkCapture(t, err)
+	// Keep the file alive through the HTTP workload and warning-delivery wait.
+	t.Cleanup(func() { file.Close() })
+	if mode == "closed-stderr" {
+		if fd := file.Fd(); fd != 2 {
+			t.Fatalf("application file descriptor = %d, want reused fd 2", fd)
+		}
+		fmt.Fprintln(os.Stdout, "application file reused fd 2")
+	} else {
+		os.Stderr = file
+		t.Cleanup(func() { os.Stderr = originalStderr })
+	}
+}
+
+func runCaptureHTTPWorkload(t *testing.T) {
+	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/capture-logging", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
 	s := httptest.NewServer(mux)
-	defer s.Close()
+	t.Cleanup(s.Close)
 	client := s.Client()
 	client.Timeout = 5 * time.Second
-	defer client.CloseIdleConnections()
+	t.Cleanup(client.CloseIdleConnections)
 	doRequest := func() {
 		resp, err := client.Get(s.URL + "/capture-logging")
 		if err != nil {
@@ -234,28 +258,27 @@ func TestCaptureLoggingChild(t *testing.T) {
 		}
 	}
 	var wg sync.WaitGroup
-	for range 16 {
+	for range captureLoggingConcurrentRequests {
 		wg.Go(doRequest)
 	}
 	wg.Wait()
 	doRequest() // HTTP must still work after the concurrent failures.
-	if os.Getenv("CONFTAMER_EVENTS") == "/dev/full" && (mode == "1" || mode == "redirected-stderr") {
-		// Wait for an observable condition, not a fixed scheduling delay. This
-		// keeps the captured stderr open until the worker has delivered its warning.
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			data, err := os.ReadFile(os.Getenv(captureLoggingFile))
-			checkCapture(t, err)
-			if bytes.Contains(data, []byte("; capture may be incomplete or invalid\n")) {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("warning was not delivered before child exit")
-			}
-			runtime.Gosched()
+}
+
+func waitForCaptureWarning(t *testing.T, path string) {
+	t.Helper()
+	// Wait for observable delivery, not a fixed scheduling delay. The child
+	// must not exit and discard the asynchronous warning before it is written.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, err := os.ReadFile(path)
+		checkCapture(t, err)
+		if bytes.Contains(data, []byte("; capture may be incomplete or invalid\n")) {
+			return
 		}
-	}
-	if mode != "1" && !t.Failed() {
-		fmt.Fprintln(os.Stdout, "HTTP completed with 204")
+		if time.Now().After(deadline) {
+			t.Fatal("warning was not delivered before child exit")
+		}
+		runtime.Gosched()
 	}
 }

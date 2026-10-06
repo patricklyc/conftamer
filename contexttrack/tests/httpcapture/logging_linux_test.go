@@ -20,7 +20,7 @@ func captureStderrPipe(t *testing.T, full bool) {
 	requireDevFull(t)
 	for _, capture := range []string{"/dev/null", "/dev/full"} {
 		t.Run(filepath.Base(capture), func(t *testing.T) {
-			cmd := captureCommand(t, &capture, "broken-stderr", "")
+			cmd := captureCommand(t, &capture, "pipe-stderr", "")
 			reader, writer, err := os.Pipe()
 			checkCapture(t, err)
 			defer reader.Close()

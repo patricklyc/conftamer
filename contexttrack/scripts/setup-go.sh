@@ -69,9 +69,14 @@ hash_stdin() {
   fi
 }
 
-# Discovery and orchestration deliberately share validated toolchain variables,
-# targets/added arrays, and the prepared overlay; leaf helpers take local inputs.
-# Establish go_bin, goroot, and goversion for all subsequent stages.
+# Shared stage outputs: validate_toolchain fills these toolchain values;
+# discover_patch_inputs fills the GOROOT-relative patched/added file arrays.
+# Later stages read them without modification; leaf helpers take local inputs.
+go_bin=
+goroot=
+goversion=
+declare -a targets=() added=()
+
 validate_toolchain() {
   go_bin=$(command -v -- "$go_cmd") || die "Go command not found: $go_cmd"
   [[ $go_bin == /* ]] || go_bin=$PWD/$go_bin
@@ -207,9 +212,12 @@ write_overlay() {
   } >"$overlay_file"
 }
 
-# Establish overlay, reusing the cache or installing a verified staging tree.
-prepare_overlay() {
-  local cache key directory tmp relative_path
+# Print the overlay path, reusing the cache or installing a verified staging tree.
+# The subshell keeps EXIT cleanup in scope, even on errexit. Command substitution
+# clears errexit by default, so explicitly enable it for preparation commands.
+prepare_overlay() (
+  set -e
+  local cache key directory overlay tmp relative_path
   cache=${CONFTAMER_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/conftamer}
   key=$(compute_overlay_key)
   directory=$cache/overlay-${goversion%% *}-$key
@@ -219,7 +227,10 @@ prepare_overlay() {
     *[[:space:]\"\\]*) die "paths must not contain whitespace, quotes, or backslashes:" \
       "$directory, $goroot (set CONFTAMER_CACHE_DIR)" ;;
   esac
-  [[ -f $overlay ]] && return
+  if [[ -f $overlay ]]; then
+    printf '%s\n' "$overlay"
+    return
+  fi
 
   mkdir -p -- "$cache"
   tmp=$(mktemp -d "$cache/.tmp-overlay.XXXXXX")
@@ -247,7 +258,8 @@ prepare_overlay() {
   fi
   trap - EXIT
   [[ -f $overlay ]] || die "failed to install $directory"
-}
+  printf '%s\n' "$overlay"
+)
 
 # print_environment GO_COMMAND OVERLAY_PATH
 print_environment() {
@@ -276,7 +288,7 @@ if [[ $mode == clone ]]; then
   exit 0
 fi
 
-prepare_overlay
+overlay=$(prepare_overlay)
 verify "$go_bin" GOFLAGS="-overlay=$overlay"
 if [[ $print == env ]]; then
   print_environment "$go_bin" "$overlay"
