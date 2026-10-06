@@ -34,16 +34,10 @@ type event struct {
 	} `json:"request_id"`
 }
 
-func events(t *testing.T, path, kind string) []event {
+func readCapture(t *testing.T, capture string) []event {
 	t.Helper()
-	capture := os.Getenv("CONFTAMER_EVENTS")
-	if capture == "" {
-		t.Fatal("set CONFTAMER_EVENTS to a fresh file before running capture tests")
-	}
 	f, err := os.Open(capture)
-	if err != nil {
-		t.Fatal(err)
-	}
+	checkCapture(t, err)
 	defer f.Close()
 	var found []event
 	scanner := bufio.NewScanner(f)
@@ -52,12 +46,23 @@ func events(t *testing.T, path, kind string) []event {
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			t.Fatalf("%s:%d: %v", capture, line, err)
 		}
+		found = append(found, e)
+	}
+	checkCapture(t, scanner.Err())
+	return found
+}
+
+func events(t *testing.T, path, kind string) []event {
+	t.Helper()
+	capture := os.Getenv("CONFTAMER_EVENTS")
+	if capture == "" {
+		t.Fatal("set CONFTAMER_EVENTS to a fresh file before running capture tests")
+	}
+	var found []event
+	for _, e := range readCapture(t, capture) {
 		if e.PID == os.Getpid() && e.Kind == kind && e.Message["req.URL.Path"] == path {
 			found = append(found, e)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		t.Fatal(err)
 	}
 	return found
 }

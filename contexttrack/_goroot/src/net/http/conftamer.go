@@ -19,15 +19,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 )
 
 var (
-	conftamerOnce    sync.Once
-	conftamerMu      sync.Mutex
-	conftamerFile    *os.File
-	conftamerEnabled bool
-	conftamerPath    string
-	conftamerOpenErr error
+	conftamerOnce          sync.Once
+	conftamerWriteWarnOnce sync.Once
+	conftamerMu            sync.Mutex
+	conftamerFile          *os.File
+	conftamerEnabled       bool
+	conftamerPath          string
+	conftamerOpenErr       error
 )
 
 func conftamerInit() {
@@ -187,7 +189,8 @@ func conftamerContext(ctx context.Context) *conftamerContextInfo {
 	}
 }
 
-// Caller (API ID) identification.
+// Caller (API ID) identification. Stack-derived attribution is best-effort
+// debug metadata, not a stable runtime interface or module ownership.
 
 var conftamerHTTPLayerPackages = map[string]bool{
 	"net/http":               true,
@@ -293,6 +296,8 @@ func conftamerHandlerCaller(handler any) *conftamerCaller {
 	return &conftamerCaller{FuncName: name, ApiId: conftamerApiID(pkg)}
 }
 
+// conftamerGoID parses runtime.Stack's debug text; this is not a stable runtime
+// goroutine-identity API and must be rechecked on Go upgrades.
 func conftamerGoID() int {
 	var buf [64]byte
 	n := runtime.Stack(buf[:], false)
@@ -327,8 +332,27 @@ func conftamerLog(ev conftamerEvent, ctx context.Context, sourceDepth int) {
 		return
 	}
 	conftamerMu.Lock()
-	conftamerFile.Write(append(lineBytes, '\n'))
+	_, err = conftamerFile.Write(append(lineBytes, '\n'))
 	conftamerMu.Unlock()
+	if err != nil {
+		conftamerWriteWarnOnce.Do(func() {
+			go conftamerWriteWarning(os.Stderr, syscall.Write, err)
+		})
+	}
+}
+
+// The single warning worker may block, but HTTP does not wait for it. Protect
+// the captured stderr File without os.File.Write's SIGPIPE exit; FD is portable.
+func conftamerWriteWarning[FD ~int | ~uintptr](stderr *os.File, write func(FD, []byte) (int, error), captureErr error) {
+	conn, err := stderr.SyscallConn()
+	if err != nil {
+		return
+	}
+	warning := []byte(fmt.Sprintf("conftamer: capture write failed for %q: %v; capture may be incomplete or invalid\n", conftamerPath, captureErr))
+	_ = conn.Write(func(fd uintptr) bool {
+		_, _ = write(FD(fd), warning)
+		return true // One best-effort attempt, even on error or a short write.
+	})
 }
 
 func conftamerRequestEvent(kind string, req *Request) conftamerEvent {
@@ -397,9 +421,11 @@ func conftamerLogResponseReceived(req *Request, resp *Response, ctx context.Cont
 }
 
 // conftamerWillReject reports whether Transport.roundTrip will reject req without
-// trying to send it, so that it is not logged as sent. The checks are mirrored
-// only for requests that no alternate protocol can take first: a cached HTTP/2
-// connection, for example, sends methods that the HTTP/1 path rejects.
+// trying to send it, so that it is not logged as sent. Keep it in step with that
+// function's validation/alternate-dispatch ordering on Go upgrades: the hook runs
+// after header/trailer validation, before alternate dispatch and HTTP/1 checks.
+// Mirror those checks only when no alternate protocol can take the request first:
+// a cached HTTP/2 connection can try methods that the HTTP/1 path rejects.
 func (t *Transport) conftamerWillReject(req *Request, isHTTP bool) bool {
 	return t.alternateRoundTripper(req) == nil &&
 		(!isHTTP || req.Method != "" && !validMethod(req.Method) || req.URL.Host == "")

@@ -69,6 +69,8 @@ hash_stdin() {
   fi
 }
 
+# Discovery and orchestration deliberately share validated toolchain variables,
+# targets/added arrays, and the prepared overlay; leaf helpers take local inputs.
 # Establish go_bin, goroot, and goversion for all subsequent stages.
 validate_toolchain() {
   go_bin=$(command -v -- "$go_cmd") || die "Go command not found: $go_cmd"
@@ -190,13 +192,15 @@ compute_overlay_key() {
   } | hash_stdin
 }
 
+# write_overlay OVERLAY_FILE PATCHED_ROOT STOCK_ROOT RELATIVE_PATH...
 write_overlay() {
-  local overlay_file=$1 patched_root=$2
+  local overlay_file=$1 patched_root=$2 stock_root=$3
+  shift 3
   local relative_path separator=
   {
     printf '{"Replace":{'
-    for relative_path in "${targets[@]}" "${added[@]}"; do
-      printf '%s\n  "%s": "%s"' "$separator" "$goroot/$relative_path" "$patched_root/$relative_path"
+    for relative_path in "$@"; do
+      printf '%s\n  "%s": "%s"' "$separator" "$stock_root/$relative_path" "$patched_root/$relative_path"
       separator=,
     done
     printf '\n}}\n'
@@ -228,13 +232,13 @@ prepare_overlay() {
   done
   apply_patch "$tmp/root" || die "go-inlibrary.patch does not apply cleanly to $goroot"
   install_added "$tmp/root"
-  write_overlay "$tmp/staging.json" "$tmp/root"
+  write_overlay "$tmp/staging.json" "$tmp/root" "$goroot" "${targets[@]}" "${added[@]}"
   verify "$go_bin" GOFLAGS="-overlay=$tmp/staging.json"
   go_query env GOFLAGS="-overlay=$tmp/staging.json" "$go_bin" build net/http ||
     die "instrumented net/http does not compile"
 
   rm -- "$tmp/staging.json"
-  write_overlay "$tmp/overlay.json" "$directory/root"
+  write_overlay "$tmp/overlay.json" "$directory/root" "$goroot" "${targets[@]}" "${added[@]}"
   printf 'go=%s\ngoroot=%s\npatch=%s\n' "$goversion" "$goroot" "$PATCH_FILE" >"$tmp/manifest"
   if [[ -e $directory ]]; then
     rm -rf -- "$tmp" # another run installed it first
@@ -245,21 +249,22 @@ prepare_overlay() {
   [[ -f $overlay ]] || die "failed to install $directory"
 }
 
+# print_environment GO_COMMAND OVERLAY_PATH
 print_environment() {
-  local goflags word found=
+  local go_command=$1 overlay_path=$2 goflags word found=
   local -a words
   # Append the overlay to the effective GOFLAGS (environment or `go env -w`).
-  goflags=$(go_query env GOFLAGS="${GOFLAGS:-}" "$go_bin" env GOFLAGS)
+  goflags=$(go_query env GOFLAGS="${GOFLAGS:-}" "$go_command" env GOFLAGS)
   read -r -a words <<<"$goflags"
   for word in "${words[@]}"; do
     case $word in
       -overlay=* | --overlay=*)
-        [[ ${word#*=} == "$overlay" ]] || die "GOFLAGS already sets a different overlay: $word"
+        [[ ${word#*=} == "$overlay_path" ]] || die "GOFLAGS already sets a different overlay: $word"
         found=1
         ;;
     esac
   done
-  [[ -n $found ]] || goflags="${goflags:+$goflags }-overlay=$overlay"
+  [[ -n $found ]] || goflags="${goflags:+$goflags }-overlay=$overlay_path"
   printf 'export GOTOOLCHAIN=local\nexport GOFLAGS=%q\n' "$goflags"
 }
 
@@ -274,7 +279,7 @@ fi
 prepare_overlay
 verify "$go_bin" GOFLAGS="-overlay=$overlay"
 if [[ $print == env ]]; then
-  print_environment
+  print_environment "$go_bin" "$overlay"
 else
   printf '%s\n' "$overlay"
 fi

@@ -27,7 +27,10 @@ def normalize_record(record: object) -> Event:
     raw = RawEvent.model_validate(record)
     message = raw.message
     # Outbound endpoint labels come only from request_id, never from message.
-    labels = raw.request_id or RawRequestID() if raw.kind == "Request sent" else message
+    if raw.kind == "Request sent":
+        labels = raw.request_id if raw.request_id is not None else RawRequestID()
+    else:
+        labels = message
     normalized_message: dict[str, object] = {
         "method": labels.method,
         "path": _path(labels.path),

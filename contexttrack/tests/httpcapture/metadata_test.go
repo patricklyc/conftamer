@@ -42,28 +42,72 @@ func (metadataHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(202)
 }
 
+func namedMetadataHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(202)
+}
+
 func TestHandlerMetadata(t *testing.T) {
-	for _, protocol := range []struct {
+	for _, handler := range []struct {
 		name string
-		h2   bool
-	}{{"http1", false}, {"http2", true}} {
-		t.Run(protocol.name, func(t *testing.T) {
-			path := "/metadata/handler/" + protocol.name
-			s := httptest.NewUnstartedServer(metadataHandler{})
-			s.EnableHTTP2 = protocol.h2
-			if protocol.h2 {
-				s.StartTLS()
-			} else {
-				s.Start()
+		h    http.Handler
+		want string
+	}{
+		{"value", metadataHandler{}, "httpcapture.metadataHandler"},
+		// Pointer handlers report the underlying type, without a pointer prefix.
+		{"pointer", &metadataHandler{}, "httpcapture.metadataHandler"},
+		{"named-function", http.HandlerFunc(namedMetadataHandler), "conftamer-contexttrack-httpcapture.namedMetadataHandler"},
+	} {
+		for _, protocol := range []struct {
+			name string
+			h2   bool
+		}{{"http1", false}, {"http2", true}} {
+			t.Run(handler.name+"/"+protocol.name, func(t *testing.T) {
+				path := "/metadata/handler/" + handler.name + "/" + protocol.name
+				s := httptest.NewUnstartedServer(handler.h)
+				s.EnableHTTP2 = protocol.h2
+				if protocol.h2 {
+					s.StartTLS()
+				} else {
+					s.Start()
+				}
+				t.Cleanup(s.Close)
+				request(t, s, "GET", path, false)
+				received := onlyEvent(t, path, "Request received")
+				assertMetadata(t, received, "server.go", captureAPI, handler.want)
+				reply := onlyEvent(t, path, "Response sent")
+				if reply.ApiId != "" || reply.Handler != "" {
+					t.Errorf("response fabricated handler attribution: %+v", reply)
+				}
+			})
+		}
+	}
+}
+
+func metadataGenericSend[T http.RoundTripper](transport T, req *http.Request) (*http.Response, error) {
+	return transport.RoundTrip(req)
+}
+
+func TestGenericCallerMetadata(t *testing.T) {
+	for _, h2 := range []bool{false, true} {
+		name := "http1"
+		if h2 {
+			name = "http2"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := "/metadata/generic/" + name
+			s := server(t, h2, path, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
+			req, err := http.NewRequest("GET", s.URL+path, nil)
+			if err != nil {
+				t.Fatal(err)
 			}
-			t.Cleanup(s.Close)
-			request(t, s, "GET", path, false)
-			received := onlyEvent(t, path, "Request received")
-			assertMetadata(t, received, "server.go", captureAPI, "httpcapture.metadataHandler")
-			reply := onlyEvent(t, path, "Response sent")
-			if reply.ApiId != "" || reply.Handler != "" {
-				t.Errorf("response fabricated handler attribution: %+v", reply)
+			resp, err := metadataGenericSend(s.Client().Transport.(*http.Transport), req)
+			if err != nil {
+				t.Fatal(err)
 			}
+			resp.Body.Close()
+			// API association must not depend on compiler-specific generic names.
+			assertMetadata(t, onlyEvent(t, path, "Request sent"), "transport.go", captureAPI, "")
+			assertResponseMetadata(t, path, true)
 		})
 	}
 }

@@ -396,6 +396,12 @@ paths may expose credentials or environment-specific data. Normalization is
 Retain original evidence for auditing, protect both files, and do not commit real
 captures/graphs. Valid JSONL, successful normalization, or nonempty captures do
 not prove completeness, HTTP delivery, or correct influence attribution.
+On a write error, the Go producer schedules at most one best-effort warning
+worker, without event payloads; HTTP does not wait for warning delivery. Closed
+stderr suppresses it safely; full stderr may block the worker, not HTTP. Process
+exit may discard it, and partial capture writes may leave invalid JSONL. Startup
+diagnostics are unchanged. See [README capture diagnostics](README.md#capture-quick-start-ctgo)
+for warning text and file-lifetime details.
 
 Python/Pydantic (including pydantic-core/typing dependencies), Go/stdlib, uv/
 uv_build, pytest, and type/lint/format/build tools are external trust boundaries.

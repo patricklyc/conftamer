@@ -7,13 +7,16 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -306,6 +309,137 @@ func TestRejectedRequestsNotSent(t *testing.T) {
 				t.Errorf("%s: rejected request logged as sent: %+v", tc.name, got)
 			}
 		}
+	}
+}
+
+func TestRejectedHeadersNotSent(t *testing.T) {
+	for _, header := range []struct{ name, key, value string }{
+		{"name", "Bad\nName", "value"},
+		{"value", "X-Test", "bad\nvalue"},
+	} {
+		for _, direct := range []bool{false, true} {
+			name := fmt.Sprintf("%s/direct=%v", header.name, direct)
+			t.Run(name, func(t *testing.T) {
+				path := "/rejected-header/" + name
+				req, err := http.NewRequest("GET", "http://rejected.invalid"+path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header[header.key] = []string{header.value}
+				var dials atomic.Int32
+				transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+					dials.Add(1)
+					return nil, fmt.Errorf("unexpected dial for invalid header")
+				}}
+				t.Cleanup(transport.CloseIdleConnections)
+				resp, err := send(&http.Client{Transport: transport}, req, direct)
+				if resp != nil {
+					resp.Body.Close()
+				}
+				if err == nil {
+					t.Error("invalid header unexpectedly accepted")
+				}
+				if got := dials.Load(); got != 0 {
+					t.Errorf("rejected header caused %d dial attempts", got)
+				}
+				if got := events(t, path, "Request sent"); len(got) != 0 {
+					t.Errorf("rejected header logged as sent: %+v", got)
+				}
+			})
+		}
+	}
+}
+
+func TestAlternateProtocolSendAttempt(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		t.Run(fmt.Sprint(direct), func(t *testing.T) {
+			path := fmt.Sprintf("/alternate-protocol/%v", direct)
+			transport := &http.Transport{}
+			t.Cleanup(transport.CloseIdleConnections)
+			transport.RegisterProtocol("capture", roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 204, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
+			}))
+			req, err := http.NewRequest("GET", "capture://alternate.invalid"+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := send(&http.Client{Transport: transport}, req, direct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 204 || resp.Request != req {
+				t.Fatalf("alternate protocol lost response status or caller identity: %+v", resp)
+			}
+			sent := onlyEvent(t, path, "Request sent")
+			if sent.RequestID.Method != "GET" || sent.RequestID.Host != "alternate.invalid" || sent.RequestID.Path != path {
+				t.Errorf("incorrect alternate-protocol send label: %+v", sent)
+			}
+			assertMetadata(t, sent, "transport.go", captureAPI, "")
+		})
+	}
+}
+
+func TestCachedHTTP2SendAttempt(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		t.Run(fmt.Sprint(direct), func(t *testing.T) {
+			prefix := fmt.Sprintf("/cached-http2/%v/", direct)
+			s := server(t, true, prefix, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			connections := make(chan httptrace.GotConnInfo, 2)
+			ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+				select {
+				case connections <- info:
+				default:
+					t.Error("unexpected extra connection acquisition")
+				}
+			}})
+			prime, err := http.NewRequestWithContext(ctx, "GET", s.URL+prefix+"prime", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := send(s.Client(), prime, direct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.ProtoMajor != 2 {
+				t.Fatalf("priming request used %s, want HTTP/2", resp.Proto)
+			}
+			var first httptrace.GotConnInfo
+			select {
+			case first = <-connections:
+			default:
+				t.Fatal("missing priming connection trace")
+			}
+			path := prefix + "bad-method"
+			req, err := http.NewRequestWithContext(ctx, "GET", s.URL+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// HTTP/1 rejects this before a send, but the cached HTTP/2 path may try.
+			req.Method = "BAD METHOD"
+			resp, err = send(s.Client(), req, direct)
+			if resp != nil {
+				resp.Body.Close()
+			}
+			t.Logf("cached HTTP/2 attempt: response=%v, error=%v", resp != nil, err)
+			// A send-attempt event alone would not prove the cached path ran.
+			select {
+			case reused := <-connections:
+				if !reused.Reused || first.Conn == nil || reused.Conn != first.Conn {
+					t.Fatalf("did not reuse the primed HTTP/2 connection: first=%+v next=%+v", first, reused)
+				}
+			default:
+				t.Fatal("bad-method request did not acquire the cached HTTP/2 connection")
+			}
+			sent := onlyEvent(t, path, "Request sent")
+			if sent.RequestID.Method != "BAD METHOD" || sent.Message["req.Method"] != "BAD METHOD" || sent.RequestID.Path != path {
+				t.Errorf("incorrect cached HTTP/2 attempt label: %+v", sent)
+			}
+			assertMetadata(t, sent, "transport.go", captureAPI, "")
+		})
 	}
 }
 

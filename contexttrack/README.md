@@ -69,6 +69,22 @@ An explicit path is **append-only**, with one JSON object per event; an empty
 value disables tracing. The library logs nothing when this variable is unset or
 empty. Use fresh paths per run, ensure the parent directory exists, and inspect
 the enabled diagnostic and actual events (`open failed` means capture failed).
+On a write error, the producer attempts this best-effort stderr warning at most
+once per process:
+
+```text
+conftamer: capture write failed for "DESTINATION": ERROR; capture may be incomplete or invalid
+```
+
+It includes only the destination and error, not event payloads. HTTP does not
+wait for warning delivery; later events still attempt writes without retrying
+the failed record. At most one asynchronous worker targets the `os.Stderr` file
+captured at the first write error, protecting it against descriptor reuse.
+Warning errors are ignored; a closed stderr pipe does not terminate HTTP through
+the warning, and a full pipe may block only this worker. Process exit does not
+wait for it and may discard the warning. Startup diagnostics are unchanged.
+Partial writes may leave invalid JSONL. Neither a successful open nor absence of
+a warning proves a complete capture.
 
 Plain `go` can use `eval "$(scripts/setup-go.sh --env)"` from this directory.
 Then set `GOTOOLCHAIN=local`, a fresh `CONFTAMER_EVENTS`, and `-count=1` yourself.
@@ -97,6 +113,11 @@ Manual setup is `cp -a` of clean Go 1.26.6, `patch --dry-run -p4` then
 cache. Edit the helper directly; regenerate hook-call patches from clean and
 modified trees, retaining `a/usr/local/go/` and `b/home/tcr6/go-conftamer/`
 prefixes for `-p4`, rather than hand-editing hunks. Run the checks below.
+On Go upgrades, reconcile `conftamerWillReject` with `Transport.roundTrip`'s
+validation/alternate-protocol ordering, recheck best-effort stack/goroutine debug
+metadata, and run **both** the race capture suite and tracing-enabled upstream
+`net/http` short tests. A tracing-off upstream run cannot check instrumented
+request identity or cancellation.
 
 ## Python install and normalize quick start
 
@@ -187,6 +208,10 @@ The [loopback suite](tests/httpcapture/) has no external dependencies; `-race`
 needs a supported platform/C compiler. It covers HTTP/1 and bundled HTTP/2,
 client/direct transport, headers and labels, routing/redirect contexts,
 body rewind/reuse, ownership/identity/cancellation, metadata, and tracing off.
+It also checks concurrent capture-write failures and full/closed stderr pipes
+after initialization (Linux `/dev/full`), healthy/disabled/open-failure controls,
+header rejection without dialing, registered protocols, proven cached HTTP/2
+attempts, and pointer/named/generic attribution.
 The full capture intentionally includes negative unstamped routing evidence
 that downstream importers may warn about; the filtered command avoids those
 negative, ownership, and cancellation cases.
@@ -237,6 +262,10 @@ outside those hooks. External routers need their own route-pattern instrumentati
 (the Prometheus patch below supplies it).
 This is not a complete wire capture. `Response sent` may need downstream
 attribution to its received request, not a fabricated API/handler association.
+Handler metadata uses the function name for a `HandlerFunc` and the underlying
+type for a typed handler (without pointer prefixes). Stack-derived API association
+and goroutine IDs parsed from runtime debug text are best-effort metadata, not
+stable runtime interfaces or authoritative module ownership.
 
 ### Target-module commands and prerequisites
 

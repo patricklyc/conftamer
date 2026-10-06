@@ -138,6 +138,29 @@ class ToolingTest(unittest.TestCase):
         self.assertIn("already exists", out.stderr)
         self.assertEqual(self.cache_entries(), [])
 
+    def test_rejects_unsafe_cache_paths(self):
+        for name in (
+            "cache space",
+            "cache\ttab",
+            "cache\nline",
+            'cache"quote',
+            "cache\\backslash",
+        ):
+            with self.subTest(path=name):
+                cache = self.tmp / name
+                out = self.run_cmd(
+                    [SETUP, "-q"], check=False, CONFTAMER_CACHE_DIR=str(cache)
+                )
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn(
+                    "paths must not contain whitespace, quotes, or backslashes",
+                    out.stderr,
+                )
+                self.assertFalse(
+                    cache.exists(), "rejected path installed a cache entry"
+                )
+                self.assertEqual(self.cache_entries(), [])
+
     def test_patch_mismatch_installs_nothing(self):
         root = self.fake_goroot()
         (root / "src/net/http/client.go").write_text("package http\n")
