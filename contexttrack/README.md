@@ -1,190 +1,248 @@
-# Context-Message Tracking
+# ContextTrack
+
+Capture HTTP messages and context evidence from Go's `net/http`, then normalize a
+completed raw JSONL capture into typed Python events.
+
+- [Capture HTTP traffic](#capture-http-traffic)
+- [Normalize an existing capture](#normalize-an-existing-capture)
+- [Inspect raw output](#inspect-raw-output)
+- [Development and verification](#development-and-verification)
+- [Platform and application caveats](#platform-and-application-caveats)
 
 ## Purpose and boundaries
 
-ContextTrack instruments Go's `net/http` with a stock-toolchain build overlay
-or a disposable patched clone. It emits opt-in, unversioned raw JSONL; the
-Python package converts that evidence into a separate normalized v1 file.
-The [wire/API contract](OUTPUT.md) owns fields, validation, file safety, privacy,
-and the separately authorized consumer handoff.
-
-The [HotNets paper](../../ConfTamer_HotNets_2026.pdf), §§4–5 and Figure 3,
-defines per-module PMGraphs relating inputs (parameters and received messages)
-to outputs (sent messages), then separate AppGraph composition. This directory
-produces message/context evidence, **not either graph**. Shared contexts suggest
-possible influence, not exact per-request causality; API attribution and capture
-coverage are best-effort. Parameter discovery, cross-module stitching,
-distributed tracing, redaction, and consumer migration are outside this package.
-
-## Developer orientation
-
 ```text
-Capture:   Go hook → conftamerLog → raw JSONL
-Normalize: completed raw capture → normalize_record → typed event → write_events
+Instrumented Go → raw JSONL → Python normalizer → normalized v1 JSONL
+                      └──→ raw diagnostics / current consumer
 ```
 
-| Start here | Responsibility |
-| --- | --- |
-| `go-inlibrary.patch` | Places hooks in stock Go's HTTP client, server, and transports |
-| `_goroot/src/net/http/conftamer.go` | Implements those hooks and writes raw events |
-| `scripts/setup-go.sh`, `bin/ctgo` | Prepare the overlay/clone and run instrumented Go |
-| `src/contexttrack/_raw.py` | Validates raw fields, including the dotted message keys |
-| `src/contexttrack/normalize.py`, `src/contexttrack/models.py` | Convert one record and define normalized event types |
-| `src/contexttrack/io.py`, `src/contexttrack/cli.py` | Read/write JSONL safely and expose the commands |
-| `tests/httpcapture/`, `tests/test_*.py` | Exercise producer behavior, tooling, and the Python package |
+Opt-in tracing writes unversioned raw JSONL; normalization writes a separate **schema v1** file.
+[OUTPUT.md](OUTPUT.md) owns the contract and pending consumer migration.
 
-Three similarly named labels have different jobs: `(pid, context_id)` groups
-possible influence within one capture, `request_id` labels an outbound endpoint,
-and `api_id` is best-effort API attribution. None is a distributed trace ID or a
-PMGraph module ID. See the [raw-to-normalized walkthrough](OUTPUT.md#walkthrough-one-received-request).
+ContextTrack produces **evidence, not graphs**. The
+[HotNets paper](../../ConfTamer_HotNets_2026.pdf) (workspace-local, outside this repository),
+§§4–5/Figure 3, defines per-module PMGraphs (parameters and received messages →
+sent messages), then AppGraph composition. Shared contexts suggest influence,
+not exact causality. Parameter discovery, stitching, distributed tracing, and
+redaction are outside this package's scope.
 
-## Capture quick start: ctgo
+## Quick starts
 
-Requires a **stock Go 1.26.6** (`go` or `$CONFTAMER_GO`); tested on Linux/amd64.
-Run [`bin/ctgo`](bin/ctgo) from the target module, wherever you would run `go`:
+Bash examples; use the working directory shown:
+
+| Task | Prerequisites | Working directory |
+| --- | --- | --- |
+| Capture | **Stock Go 1.26.6**, Bash; tested on Linux/amd64 | Target Go module |
+| Normalize | **Python >=3.14**, uv (or an installed package) | `contexttrack/` with uv |
+| Inspect raw | **Python >=3.10**; Graphviz only for SVG rendering | `contexttrack/` |
+
+### Capture HTTP traffic
+
+**Recommended: `ctgo` overlays the hooks without modifying installed Go.**
+Put [`ctgo`](bin/ctgo) on PATH; select another stock Go 1.26.6 with
+`export CONFTAMER_GO=/path/to/stock-go1.26.6/bin/go`.
 
 ```bash
-export PATH="/path/to/conftamer/contexttrack/bin:$PATH"  # optional
-cd /path/to/target/module
-ctgo test ./path/to/http/package
-# ctgo: CONFTAMER_EVENTS=/tmp/contexttrack-test-....jsonl
-# conftamer: enabled — writing "/tmp/contexttrack-test-....jsonl"
+CT=/path/to/conftamer/contexttrack
+export PATH="$CT/bin:$PATH"
+RUN=$(mktemp -d /tmp/contexttrack-run.XXXXXX) &&
+cd /path/to/target/module &&
+CONFTAMER_EVENTS="$RUN/raw.jsonl" ctgo test -v ./path/to/http/package &&
+wc -l "$RUN/raw.jsonl"
+# conftamer: enabled — writing "/tmp/contexttrack-run....../raw.jsonl"
 ```
 
-[`scripts/setup-go.sh`](scripts/setup-go.sh) copies only patched files from
-`go env GOROOT`, applies [`go-inlibrary.patch`](go-inlibrary.patch) without fuzz,
-and adds [`conftamer.go`](_goroot/src/net/http/conftamer.go). Go ignores the
-`_goroot/` directory when building the parent module. The overlay cache is
-`${XDG_CACHE_HOME:-~/.cache}/conftamer/` (`CONFTAMER_CACHE_DIR` overrides it),
-keyed by Go version, GOROOT, patch, and sources; changes rebuild it. Setup rejects
-other versions, already-patched GOROOTs, and inexact patches: investigate a
-version mismatch rather than forcing a hunk. **The installed GOROOT is untouched.**
+The diagnostic confirms the file opened; a nonzero count confirms events,
+**not completeness or correct influence attribution**. `ctgo` defaults tests to
+`-count=1`; `-v` exposes passing-test diagnostics. Keep `$RUN/raw.jsonl`.
+See [setup](#capture-setup-and-diagnostics) for file handling and alternatives.
 
-`ctgo` checks on every invocation that `net/http` includes `conftamer.go`, sets
-`GOTOOLCHAIN=local`, and appends the overlay to `GOFLAGS` (including child Go
-commands). For `test`, it adds `-count=1` unless supplied, avoiding cached empty
-captures. For `test`/`run`, an unset `CONFTAMER_EVENTS` selects a fresh file in
-`CONFTAMER_EVENTS_DIR` (default `$TMPDIR` or `/tmp`) and prints its path.
-An explicit path is **append-only**, with one JSON object per event; an empty
-value disables tracing. The library logs nothing when this variable is unset or
-empty. Use fresh paths per run, ensure the parent directory exists, and inspect
-the enabled diagnostic and actual events (`open failed` means capture failed).
-On a write error, the producer attempts this best-effort stderr warning at most
-once per process:
+### Normalize an existing capture
+
+Already have a completed raw capture? **No Go or consumer repository is needed.**
+The recommended source-checkout workflow uses [uv](https://docs.astral.sh/uv/):
+
+```bash
+cd /path/to/conftamer/contexttrack &&
+uv python install 3.14 &&
+uv sync --locked --no-dev &&
+uv run --no-dev contexttrack --help
+```
+
+Stop capture first. Keep the raw file and choose a **new output in an existing directory**:
+
+```bash
+uv run --no-dev contexttrack normalize /path/to/raw.jsonl --output /path/to/new-normalized.jsonl
+```
+
+Success is silent (exit 0); input/filesystem errors exit 2 with diagnostics,
+no traceback. Empty captures succeed. OUTPUT provides a
+[before/after walkthrough](OUTPUT.md#walkthrough-one-received-request),
+[CLI](OUTPUT.md#cli), [Python API](OUTPUT.md#public-python-api), and
+[validation/publication rules](OUTPUT.md#streaming-jsonl-io).
+
+**`analysis/` and `conftamer-cli/node-query` require raw captures, not normalized files.**
+Normalization is **not redaction**; protect both files and never commit real captures
+or generated graphs. See [privacy limits](OUTPUT.md#privacy-trust-boundaries-and-human-audit).
+
+### Capture then normalize
+
+After Python setup:
+
+```bash
+CT=/path/to/conftamer/contexttrack
+RUN=$(mktemp -d /tmp/contexttrack-run.XXXXXX) &&
+(cd /path/to/target/module && CONFTAMER_EVENTS="$RUN/raw.jsonl" \
+  "$CT/bin/ctgo" test -v ./path/to/http/package) &&
+(cd "$CT" && uv run --no-dev contexttrack normalize "$RUN/raw.jsonl" \
+  --output "$RUN/normalized.jsonl")
+```
+
+`$RUN` holds raw output for diagnostics and the current consumer, plus normalized
+output for typed readers.
+
+<details>
+<summary>Alternative: install a wheel into a separate environment</summary>
+
+### Install a wheel instead
+
+For an existing Python 3.14+ environment, from `contexttrack/`:
+
+```bash
+DIST=$(mktemp -d /tmp/contexttrack-dist.XXXXXX) &&
+uv build --wheel --out-dir "$DIST" &&
+uv pip install --python /path/to/venv/bin/python "$DIST"/contexttrack-0.2.0-*.whl
+```
+
+Use that environment's interpreter; activation and PATH changes are unnecessary:
+
+```bash
+/path/to/venv/bin/python -m contexttrack --help
+```
+
+</details>
+
+## Capture setup and diagnostics
+
+[`setup-go.sh`](scripts/setup-go.sh) copies affected Go files, applies
+[`go-inlibrary.patch`](go-inlibrary.patch) without fuzz, and adds
+[`conftamer.go`](_goroot/src/net/http/conftamer.go), **never changing installed GOROOT**.
+Mismatched/already-patched trees are rejected; never force a patch.
+The cache is `${XDG_CACHE_HOME:-~/.cache}/conftamer/` (`CONFTAMER_CACHE_DIR` overrides
+it); toolchain, patch, or source changes invalidate it. `ctgo` verifies the overlay
+each invocation and exports `GOTOOLCHAIN=local` and the overlay in `GOFLAGS`
+for child Go commands.
+
+| `CONFTAMER_EVENTS` | Behavior |
+| --- | --- |
+| Unset with `ctgo test`/`run` | Creates a fresh file and prints its path; `CONFTAMER_EVENTS_DIR` selects the directory (default `$TMPDIR` or `/tmp`) |
+| Explicit nonempty path | Appends one JSON object per event; the producer does not create parent directories |
+| Empty | Disables tracing |
+| Unset without `ctgo` | Disables tracing |
+
+Use fresh paths per run. Startup reports enabled or `open failed`; passing tests
+without `-v` can hide diagnostics. Write failures trigger at most one best-effort
+stderr warning per process:
 
 ```text
 conftamer: capture write failed for "DESTINATION": ERROR; capture may be incomplete or invalid
 ```
 
-It includes only the destination and error, not event payloads. HTTP does not
-wait for warning delivery; later events still attempt writes without retrying
-the failed record. At most one asynchronous worker targets the `os.Stderr` file
-captured at the first write error, protecting it against descriptor reuse.
-Warning errors are ignored; a closed stderr pipe does not terminate HTTP through
-the warning, and a full pipe may block only this worker. Process exit does not
-wait for it and may discard the warning. Startup diagnostics are unchanged.
-Partial writes may leave invalid JSONL. Neither a successful open nor absence of
-a warning proves a complete capture.
+Failures may leave invalid JSONL. HTTP does not wait for warnings;
+[implementation details](MAINTAINING.md#capture-write-warning-implementation)
+cover delivery and failed-write handling.
 
-Plain `go` can use `eval "$(scripts/setup-go.sh --env)"` from this directory.
-Then set `GOTOOLCHAIN=local`, a fresh `CONFTAMER_EVENTS`, and `-count=1` yourself.
-An exported GOROOT is safe for the overlay only if it names the stock 1.26.6 tree
-that Go uses. Editors/gopls do not see the overlay; event `file` values name stock
-GOROOT paths. Changing stdlib instrumentation forces a slow first rebuild;
-large module graphs may take minutes before any test output appears.
+<details>
+<summary>Advanced alternatives: plain Go or a disposable clone</summary>
+
+### Plain Go with an overlay
+
+From `contexttrack/`, export the overlay and `GOTOOLCHAIN=local`:
+
+```bash
+overlay_env=$(scripts/setup-go.sh --env) &&
+  eval "$overlay_env"
+```
+
+After successful setup, use the same Go executable, fresh `CONFTAMER_EVENTS`, and
+`-count=1`. An exported GOROOT must name stock Go 1.26.6. Editors and gopls miss overlays;
+event paths name stock files, but line numbers refer to patched sources.
+Rebuilds may take minutes.
 
 ### Disposable clone fallback
 
-For build systems that override `GOFLAGS`/`GOTOOLCHAIN`:
+For build systems that override `GOFLAGS`/`GOTOOLCHAIN`, use an absolute clone
+path that does not exist. This stops on failure and checks that Go uses the clone:
 
 ```bash
-scripts/setup-go.sh --clone /path/to/go-conftamer  # DEST must not exist
-unset GOROOT                  # otherwise the clone may use an unpatched stdlib
-export GOTOOLCHAIN=local
-/path/to/go-conftamer/bin/go env GOROOT  # must name the clone
-export CONFTAMER_EVENTS="$(mktemp /tmp/contexttrack-clone.XXXXXX.jsonl)"
-# From the target module:
-/path/to/go-conftamer/bin/go test -count=1 ./path/to/http/package
+CT=/path/to/conftamer/contexttrack
+CLONE=/path/to/go-conftamer
+cd "$CT" &&
+scripts/setup-go.sh --clone "$CLONE" &&
+unset GOROOT &&
+export GOTOOLCHAIN=local &&
+[[ "$("$CLONE/bin/go" env GOROOT)" -ef "$CLONE" ]] &&
+CONFTAMER_EVENTS=$(mktemp /tmp/contexttrack-clone.XXXXXX.jsonl) &&
+export CONFTAMER_EVENTS &&
+(cd /path/to/target/module &&
+  "$CLONE/bin/go" test -v -count=1 ./path/to/http/package)
 ```
 
-Manual setup is `cp -a` of clean Go 1.26.6, `patch --dry-run -p4` then
-`patch -p4 < go-inlibrary.patch` (or `git apply -p4`) in the copy, plus
-`conftamer.go` in its `src/net/http/`. Never patch an installed tree or module
-cache. Edit the helper directly; regenerate hook-call patches from clean and
-modified trees, retaining `a/usr/local/go/` and `b/home/tcr6/go-conftamer/`
-prefixes for `-p4`, rather than hand-editing hunks. Run the checks below.
-On Go upgrades, reconcile `conftamerWillReject` with `Transport.roundTrip`'s
-validation/alternate-protocol ordering, recheck best-effort stack/goroutine debug
-metadata, and run **both** the race capture suite and tracing-enabled upstream
-`net/http` short tests. A tracing-off upstream run cannot check instrumented
-request identity or cancellation.
+Never patch installed Go or module caches. [Maintainer notes](MAINTAINING.md)
+cover manual patching and upgrades.
 
-## Python install and normalize quick start
+</details>
 
-ContextTrack **0.2.0** requires Python **>=3.14** and Pydantic **>=2.13.5,<3**;
-package and schema versions are independent. With [uv](https://docs.astral.sh/uv/),
-from `contexttrack/`:
+## Inspect raw output
+
+From `contexttrack/`, pass a completed **raw** path explicitly:
 
 ```bash
-uv python install 3.14
-uv sync --locked --dev
-uv run contexttrack --help
+EV=/path/to/fresh-raw.jsonl
+python3 analysis/group_by_context.py "$EV"
+python3 analysis/message_graph.py "$EV" --format text
+python3 analysis/message_graph.py "$EV" --recv-sent --format dot > /path/to/new-messages.dot &&
+# Optional: Graphviz, another fresh destination, and a graph with edges:
+if grep -q '^digraph messages {' /path/to/new-messages.dot; then
+  dot -Tsvg /path/to/new-messages.dot -o /path/to/new-messages.svg
+fi
 ```
 
-Or build outside the checkout and install in a separate existing Python 3.14+
-environment (no Go or consumer repository required):
+When no edges exist, graph output is `(no edges found)`, not DOT; the guard above
+skips rendering. Empty files are rejected by the raw-analysis reader.
 
-```bash
-DIST=$(mktemp -d /tmp/contexttrack-dist.XXXXXX)
-uv build --wheel --out-dir "$DIST"
-uv pip install --python /path/to/venv/bin/python "$DIST"/contexttrack-0.2.0-*.whl
-```
+[`message_graph.py`](analysis/message_graph.py) keeps each node key's first
+occurrence per `(pid, context_id)` group. It links consecutive deduplicated nodes:
+`A → B → A → C` becomes `A → B → C`. `--recv-sent` links receives to later sends
+in that same sequence. Neither mode preserves occurrence-level ordering.
+These views are diagnostic, **not PMGraphs or causal graphs**; see the
+[raw mapping](OUTPUT.md#raw-mapping-and-strictness-differences).
 
-Stop capture first. Keep the raw file and use **new outputs in existing directories**:
+## Development and verification
 
-```bash
-uv run contexttrack normalize /path/to/raw.jsonl --output /path/to/new-normalized.jsonl
-uv run python -m contexttrack normalize /path/to/raw.jsonl --output /path/to/new-module.jsonl
-uv run contexttrack schema  # model-generated normalized v1 schema on stdout
-```
+Run from `contexttrack/`; see the [source map](MAINTAINING.md#source-map).
 
-Omit `uv run` in an installed environment. Success is silent (exit 0); expected
-input/filesystem errors exit 2 with stderr diagnostics and no traceback.
-There is no overwrite/append/skip-bad/stdout-output mode or format auto-detection.
-See [streaming I/O](OUTPUT.md#streaming-jsonl-io) for rollback/publication guarantees
-and [public API](OUTPUT.md#public-python-api) for in-memory raw reading.
-
-**`analysis/` and `conftamer-cli/node-query` still require raw captures.** Do not
-pass normalized files to them. For conversion rules and incomplete/repeated
-observations, see [raw mapping](OUTPUT.md#raw-mapping-and-strictness-differences).
-Even an empty capture normalizes successfully; success is not a completeness
-check. Protect both files as described in
-[privacy and audit limits](OUTPUT.md#privacy-trust-boundaries-and-human-audit).
-
-## Tests and generated schema
-
-From `contexttrack/` in the installed development environment:
+### Python checks and generated schema
 
 ```bash
 uv sync --locked --dev
 uv run pytest -q
-uv run pytest -q tests/test_cli.py tests/test_api.py
 ```
 
-The CLI tests compare public schema output with `EVENT_ADAPTER.json_schema()`;
-there is **no checked-in snapshot**. Export to a fresh scratch destination with
-[these generation instructions](OUTPUT.md#generated-json-schema). Independent
-model/normalization tests own literal field expectations, not schema introspection.
+Schema tests compare with `EVENT_ADAPTER.json_schema()`; **no checked-in snapshot**.
+Model and normalization tests own literal expectations. See
+[schema export](OUTPUT.md#generated-json-schema).
 
-Python completion checks are separate from capture checks; scope excludes the
-unchanged standard-library tooling tests from ty/Ruff:
+<details>
+<summary>Type, lint, format, and syntax checks</summary>
+
+Check the package and pytest files; exclude unchanged tooling tests:
 
 ```bash
-PYTHON_SCOPE=(
-  src/contexttrack tests/conftest.py tests/test_validation.py tests/test_models.py
-  tests/test_normalize.py tests/test_readers.py tests/test_writers.py
-  tests/test_roundtrip.py tests/test_api.py tests/test_cli.py
-)
+PYTHON_SCOPE=(src/contexttrack)
+for test_file in tests/*.py; do
+  [[ $test_file == tests/test_tooling.py ]] || PYTHON_SCOPE+=("$test_file")
+done
 uvx ty check "${PYTHON_SCOPE[@]}"
 uvx ruff check "${PYTHON_SCOPE[@]}"
 uvx ruff format --check "${PYTHON_SCOPE[@]}"
@@ -194,84 +252,85 @@ PYTHONPYCACHEPREFIX="$(mktemp -d /tmp/contexttrack-pycache.XXXXXX)" \
   uv run python -m py_compile src/contexttrack/*.py tests/*.py
 ```
 
-With stock Go 1.26.6, Bash, python3, and gofmt:
+</details>
+
+### Capture checks
+
+Capture checks also require python3 and gofmt; `-race` needs a supported platform
+and C compiler:
 
 ```bash
 scripts/check.sh  # --no-race without a C compiler; --clone also checks clone mode
+```
+
+The [loopback suite](tests/httpcapture/) needs no services. Full captures contain
+unstamped routes that may warn downstream; the focused example excludes these
+and request-ownership/cancellation cases. The focused command is a self-contained
+capture check; no target application is needed.
+
+`check.sh` stops at the first failure: static checks, overlay setup and vet,
+tooling tests, Go capture tests with the race detector, **tracing-on** upstream
+HTTP short tests, then raw-analysis checks (consumer fixture if available).
+Outputs: `${TMPDIR:-/tmp}/contexttrack-check.*`.
+Package pytest, ty/Ruff/Tombi, wheel, and consumer checks are separate.
+
+<details>
+<summary>Focused capture, tooling, and upstream checks</summary>
+
+```bash
 python3 -m unittest tests/test_tooling.py -v  # CONTEXTTRACK_TEST_CLONE=1 enables clone tests
 (cd tests/httpcapture && ../../bin/ctgo test -race ./...)
 (cd tests/httpcapture && ../../bin/ctgo test \
   -run 'TestRoundTripCapture|TestRedirectLabels|TestInheritedContext' ./...)
+CTGO="$PWD/bin/ctgo"
+(cd "$("$CTGO" env GOROOT)/src/net/http" && "$CTGO" test -short .)
 ```
 
-The [loopback suite](tests/httpcapture/) has no external dependencies; `-race`
-needs a supported platform/C compiler. It covers HTTP/1 and bundled HTTP/2,
-client/direct transport, headers and labels, routing/redirect contexts,
-body rewind/reuse, ownership/identity/cancellation, metadata, and tracing off.
-It also checks concurrent capture-write failures and full/closed stderr pipes
-after initialization (Linux `/dev/full`), healthy/disabled/open-failure controls,
-header rejection without dialing, registered protocols, proven cached HTTP/2
-attempts, and pointer/named/generic attribution.
-The full capture intentionally includes negative unstamped routing evidence
-that downstream importers may warn about; the filtered command avoids those
-negative, ownership, and cancellation cases.
+Upstream tests need **tracing enabled** to check instrumented request identity
+and cancellation.
 
-`scripts/check.sh` stops at the first failure: shell syntax (shellcheck if
-available), gofmt, Python syntax and diff checks; overlay setup and `go vet`;
-tooling tests; race regression; **tracing-on** upstream `net/http` short tests;
-then unchanged raw-analysis smoke on the fresh capture and the committed
-`node-query` scrape fixture if available. Outputs stay in a new
-`/tmp/contexttrack-check.*` directory. It does not run package pytest, ty/Ruff/
-Tombi, wheel checks, or consumer compatibility tests. To run upstream alone:
+</details>
 
-```bash
-(cd "$(go env GOROOT)/src/net/http" && /path/to/contexttrack/bin/ctgo test -short .)
-```
-
-Automated success is not complete-project human audit/sign-off; see OUTPUT.
+Automated checks do not replace [human audit](OUTPUT.md#privacy-trust-boundaries-and-human-audit).
 
 ## Platform and application caveats
 
 ### Instrumented request and hook boundaries
 
-IDs are stamped at HTTP origins and inherited by redirects and derived contexts;
-[context identity](OUTPUT.md#context-identity) specifies their grouping rules.
-Unstamped contexts logged elsewhere report `context.error`, not a fabricated
-per-event ID. The historical [`go-inlibrary-optional.patch`](go-inlibrary-optional.patch)
-walks heap roots; it is not the current format, risks address reuse/custom-type
-errors, and cannot be combined with ID-based analysis or cross-run correlation.
+This is not a complete wire capture:
 
-The caller's request is never stamped in place. Only an outbound request missing
-an ID gets a private stamped copy; inherited-ID requests are not copied again.
-Only that exact private copy is unwrapped, **not Go's or an application's copies**.
-`Response.Request`, `CheckRedirect`'s `via`, and `Transport.CancelRequest` preserve
-the caller's pointer. Other RoundTrippers, `Transport.Proxy`, or protocols
-registered with `Transport.RegisterProtocol` may still receive the private copy.
-Tracing-disabled behavior otherwise follows stock Go.
-
-`Request sent` records a transport **attempt**, including later dial failure.
-Pre-attempt rejects (unsupported scheme, invalid method/header, missing host)
-are not logged unless an alternate protocol, e.g. cached HTTP/2, may take them.
-`Client.Do` and wire hooks can both report a response: do not assume one event
-per exchange. Bundled HTTP/2 logs final client headers even for direct transport
-calls; informational HTTP/2 client responses and external `golang.org/x/net/http2`
-are not covered. `Transport.NewClientConn`'s `ClientConn` bypasses `Request sent`.
-Server receipt is logged at `serverHandler.ServeHTTP` before arbitrary handler
-dispatch. Protocol rejects before dispatch and mocked/bypassed HTTP paths are
-outside those hooks. External routers need their own route-pattern instrumentation
-(the Prometheus patch below supplies it).
-This is not a complete wire capture. `Response sent` may need downstream
-attribution to its received request, not a fabricated API/handler association.
-Handler metadata uses the function name for a `HandlerFunc` and the underlying
-type for a typed handler (without pointer prefixes). Stack-derived API association
-and goroutine IDs parsed from runtime debug text are best-effort metadata, not
-stable runtime interfaces or authoritative module ownership.
+- **Contexts:** IDs originate at HTTP boundaries and are inherited by derived contexts
+  and redirects. Unstamped contexts report `context.error`. Group by
+  **`(pid, context_id)` within one capture** ([identity](OUTPUT.md#context-identity)). The historical
+  [root-address patch](go-inlibrary-optional.patch) is incompatible with ID-based
+  analysis and supplies no cross-run identity.
+- **Ownership:** Only outbound requests missing IDs get private stamped copies,
+  never in-place stamps. Only the exact copy is unwrapped to preserve
+  `Response.Request`, redirect `via`, and `CancelRequest`. Other RoundTrippers,
+  `Transport.Proxy`, and registered protocols may receive the copy.
+  Tracing-disabled behavior otherwise follows stock Go.
+- **Client:** `Request sent` records attempts, including later dial failures.
+  Pre-attempt rejects are not logged unless an alternate protocol can take them.
+  `Client.Do` and wire hooks may both report a response. Bundled HTTP/2 records
+  final client headers, including direct transport calls, not informational responses.
+  External `golang.org/x/net/http2` is not covered; `Transport.NewClientConn`'s
+  `ClientConn` bypasses send hooks.
+- **Server:** Receipt precedes handler dispatch; earlier protocol rejects and
+  mocked/bypassed HTTP paths are not covered. External routers need route hooks.
+- **Attribution:** `request_id` labels outbound endpoints, not occurrences;
+  `api_id` is best-effort attribution, not module identity. Sent responses have
+  no API/handler association; consumers may associate them with received requests.
+  Handler labels use function/underlying type names (no pointer prefixes).
+  Stack-derived API IDs and debug goroutine IDs are not stable runtime interfaces.
 
 ### Target-module commands and prerequisites
 
-Use `ctgo` on PATH, a fresh capture per invocation, and run in the named writable
-application checkout/module. With a clone, use its `bin/go` and the environment
-above. These are application examples, not self-contained package tests:
+<details>
+<summary>Optional recipes: Prometheus, Caddy, and Kubernetes</summary>
+
+These **illustrative, version-dependent** commands have no recorded verified
+application revisions. Check your checkout's prerequisites; use a writable target
+module, fresh capture paths, and `ctgo` or the clone's `bin/go`.
 
 | Target directory | Command | Prerequisites / limits |
 | --- | --- | --- |
@@ -281,10 +340,10 @@ above. These are application examples, not self-contained package tests:
 | Kubernetes `staging/src/k8s.io/client-go` | `ctgo test ./transport/... ./rest/... ./tools/...` | No etcd; this covers selected staging packages, not all modules |
 | Kubernetes root | `ctgo test ./test/integration/endpoints/` (optionally `-run TestEndpointWithMultiplePods`) | etcd on PATH; other integration packages have their own prerequisites |
 
-Prometheus uses `common/route` around `julienschmidt/httprouter`, not just
-ServeMux. Without its hook, `/api/v1/query` may appear as coarse `/api/v1/`.
-Apply [`prometheus-common-route.patch`](prometheus-common-route.patch) to a
-**writable copy of common v0.69.0**, never the read-only module cache:
+Prometheus `common/route` around `julienschmidt/httprouter` can yield coarse
+ServeMux patterns (`/api/v1/` for `/api/v1/query`). The
+[route patch](prometheus-common-route.patch) targets **common v0.69.0**, not a
+verified Prometheus release. Confirm the dependency and use a writable copy:
 
 ```bash
 cp -r ~/go/pkg/mod/github.com/prometheus/common@v0.69.0 ~/common-conftamer
@@ -293,37 +352,25 @@ chmod -R u+w ~/common-conftamer
 ```
 
 In Prometheus's `go.mod`: `replace github.com/prometheus/common => /path/to/common-conftamer`.
-This calls patched `http.ConftamerLogRouted`, so build with ctgo/a patched clone.
-Patterns preserve ServeMux `{name}` and httprouter `:name`/`*path` syntaxes; the
-consumer does not reconstruct ambiguous/rewritten routing chains.
+Build with ctgo/a patched clone for `http.ConftamerLogRouted`. Patterns retain
+ServeMux `{name}` and httprouter `:name`/`*path`; the consumer cannot reconstruct
+ambiguous/rewritten routing chains. Never patch the read-only module cache.
 
-Kubernetes `make`/`hack/` may fetch/switch Go or override overlay flags; verify the
-actual toolchain or use a clone. Naive root `go test ./...` build failures are not
-evidence of hook failures: scope to the modules/packages above. If etcd is absent,
-run `hack/install-etcd.sh` from Kubernetes root and add
-`$HOME/kubernetes/third_party/etcd` to PATH; `framework.EtcdMain` uses
-`exec.LookPath("etcd")` before tests. Apiserver's
-`WithTimeoutForNonLongRunningRequests` can emit orphan 504 responses while racing
-a handler deadline; investigate `RequestTimeout` in
-`staging/src/k8s.io/apiserver/pkg/server/config.go` (increasing it changes the test
-scenario, not normalization). Check for stale servers with `ss -tlnp | grep 9090`
-(Prometheus) or port `2999` (Caddy); stop the identified stale process safely.
+</details>
 
-## Inspect raw output
+<details>
+<summary>Application troubleshooting (check against your revision/environment)</summary>
 
-From `contexttrack/`, pass an explicit completed **raw** path (script defaults differ):
+- **Toolchain overrides:** Kubernetes `make`/`hack/` may change Go or overlay flags;
+  verify them or use a clone. Scope tests correctly; root build failures do not
+  establish hook failures.
+- **etcd:** Run `hack/install-etcd.sh` if your checkout provides it; add
+  **its reported directory** to PATH before tests.
+- **Timeouts:** Kubernetes middleware can race handlers and emit orphan 504s.
+  Check your revision's `RequestTimeout` (historically
+  `staging/src/k8s.io/apiserver/pkg/server/config.go`); increasing it changes the
+  test scenario, not normalization.
+- **Stale servers:** Use `ss -tlnp` with configured test ports. Identify owners
+  before stopping processes.
 
-```bash
-EV=/path/to/fresh-raw.jsonl
-python3 analysis/group_by_context.py "$EV"
-python3 analysis/message_graph.py "$EV" --format text
-python3 analysis/message_graph.py "$EV" --recv-sent --format dot > /path/to/new-messages.dot
-# Optional, requires Graphviz and another fresh destination:
-dot -Tsvg /path/to/new-messages.dot -o /path/to/new-messages.svg
-```
-
-[`message_graph.py`](analysis/message_graph.py) normally links consecutive distinct
-messages in each context group; `--recv-sent` links receives to later sends.
-These co-occurrence views are diagnostic, not canonical PMGraphs or
-occurrence-accurate/cross-process causal graphs. See OUTPUT for the five raw
-kinds, dotted fields, and why normalized files are not input to these scripts.
+</details>

@@ -400,7 +400,7 @@ On a write error, the Go producer schedules at most one best-effort warning
 worker, without event payloads; HTTP does not wait for warning delivery. Closed
 stderr suppresses it safely; full stderr may block the worker, not HTTP. Process
 exit may discard it, and partial capture writes may leave invalid JSONL. Startup
-diagnostics are unchanged. See [README capture diagnostics](README.md#capture-quick-start-ctgo)
+diagnostics are unchanged. See [README capture diagnostics](README.md#capture-setup-and-diagnostics)
 for warning text and file-lifetime details.
 
 Python/Pydantic (including pydantic-core/typing dependencies), Go/stdlib, uv/
