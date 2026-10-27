@@ -13,7 +13,7 @@ usage: scripts/check.sh [--no-race] [--no-upstream] [--clone]
   --clone        Also test clone mode (copies the whole GOROOT).
 
 Uses the Go command in $CONFTAMER_GO (default 'go'), which must be a stock
-Go 1.26.6. Requires python3, gofmt, and bash.
+Go 1.26.10. Requires python3, gofmt, and bash.
 EOF
 }
 

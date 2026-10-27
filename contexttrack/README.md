@@ -32,15 +32,21 @@ Bash examples; use the working directory shown:
 
 | Task | Prerequisites | Working directory |
 | --- | --- | --- |
-| Capture | **Stock Go 1.26.6**, Bash; tested on Linux/amd64 | Target Go module |
+| Capture | **Stock Go 1.26.10**, Bash; tested on Linux/amd64 | Target Go module |
 | Normalize | **Python >=3.14**, uv (or an installed package) | `contexttrack/` with uv |
 | Inspect raw | **Python >=3.10**; Graphviz only for SVG rendering | `contexttrack/` |
+
+Go 1.26.10 includes the upstream [eMudhra certificate-distrust fix](https://go.dev/blog/emudhra-incident).
+Installing the compiler or editing `go.mod` does **not** update existing binaries:
+rebuild affected applications, verify `go version -m /path/to/binary` reports
+`go1.26.10`, then replace and restart the deployed artifacts. Do not reuse an old
+instrumented clone; see [upgrade verification](MAINTAINING.md#go-upgrades).
 
 ### Capture HTTP traffic
 
 **Recommended: `ctgo` overlays the hooks without modifying installed Go.**
-Put [`ctgo`](bin/ctgo) on PATH; select another stock Go 1.26.6 with
-`export CONFTAMER_GO=/path/to/stock-go1.26.6/bin/go`.
+Put [`ctgo`](bin/ctgo) on PATH; select another stock Go 1.26.10 with
+`export CONFTAMER_GO=/path/to/stock-go1.26.10/bin/go`.
 
 ```bash
 CT=/path/to/conftamer/contexttrack
@@ -165,7 +171,7 @@ overlay_env=$(scripts/setup-go.sh --env) &&
 ```
 
 After successful setup, use the same Go executable, fresh `CONFTAMER_EVENTS`, and
-`-count=1`. An exported GOROOT must name stock Go 1.26.6. Editors and gopls miss overlays;
+`-count=1`. An exported GOROOT must name stock Go 1.26.10. Editors and gopls miss overlays;
 event paths name stock files, but line numbers refer to patched sources.
 Rebuilds may take minutes.
 

@@ -3,7 +3,7 @@
 # Overlay mode patches copied files; --clone copies the entire toolchain.
 set -euo pipefail
 
-REQUIRED_GO_VERSION=go1.26.6
+REQUIRED_GO_VERSION=go1.26.10
 PATCH_STRIP=4
 CT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 PATCH_FILE=$CT_DIR/go-inlibrary.patch

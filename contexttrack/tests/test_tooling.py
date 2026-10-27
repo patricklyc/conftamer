@@ -1,7 +1,7 @@
 """Regression tests for scripts/setup-go.sh and bin/ctgo.
 
 Run from contexttrack/ with:  python3 -m unittest tests/test_tooling.py -v
-Requires a stock Go 1.26.6 (CONFTAMER_GO or `go` on PATH); without one the
+Requires a stock Go 1.26.10 (CONFTAMER_GO or `go` on PATH); without one the
 tests are skipped, or fail if CONTEXTTRACK_REQUIRE_GO=1. The clone-mode test
 copies the whole GOROOT and runs only with CONTEXTTRACK_TEST_CLONE=1.
 """
@@ -21,7 +21,7 @@ SETUP = CT / "scripts" / "setup-go.sh"
 CTGO = CT / "bin" / "ctgo"
 ADDED = CT / "_goroot" / "src" / "net" / "http" / "conftamer.go"
 TARGETS = ["client.go", "h2_bundle.go", "request.go", "server.go", "transport.go"]
-REQUIRED = "go1.26.6"
+REQUIRED = "go1.26.10"
 
 
 def _real_go():
@@ -109,6 +109,7 @@ class ToolingTest(unittest.TestCase):
     def test_overlay_is_built_once_and_leaves_goroot_stock(self):
         overlay = self.setup_overlay()
         manifest = overlay.parent / "manifest"
+        self.assertIn("go=go1.26.10", manifest.read_text().splitlines())
         mtime = manifest.stat().st_mtime_ns
         self.assertEqual(self.setup_overlay(), overlay)
         self.assertEqual(manifest.stat().st_mtime_ns, mtime, "cached overlay was rebuilt")
@@ -125,10 +126,14 @@ class ToolingTest(unittest.TestCase):
         self.assertFalse((stock / "conftamer.go").exists())
 
     def test_rejects_other_go_version(self):
-        out = self.run_cmd([SETUP, "--go", self.shim], check=False, SHIM_GOVERSION="go1.25.0")
-        self.assertNotEqual(out.returncode, 0)
-        self.assertIn(f"targets {REQUIRED}", out.stderr)
-        self.assertEqual(self.cache_entries(), [])
+        for version in ("go1.25.0", "go1.26.6", "go1.26.9", "go1.26.11", "go1.27.3"):
+            with self.subTest(version=version):
+                out = self.run_cmd(
+                    [SETUP, "--go", self.shim], check=False, SHIM_GOVERSION=version
+                )
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn(f"targets {REQUIRED}", out.stderr)
+                self.assertEqual(self.cache_entries(), [])
 
     def test_rejects_already_patched_goroot(self):
         root = self.fake_goroot()
