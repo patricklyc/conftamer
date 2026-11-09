@@ -2,7 +2,7 @@
 
 [README.md](README.md) owns installation, capture commands, tests, and application
 caveats. [OUTPUT.md](OUTPUT.md) owns the raw and normalized event contracts. These
-notes cover instrumentation maintenance and capture-warning implementation details,
+notes cover instrumentation internals, maintenance, and capture-warning details,
 not additional capture guarantees.
 
 ## Source map
@@ -24,6 +24,26 @@ Normalize: completed raw capture → normalize_record → typed event → write_
 
 Go ignores `_goroot/` when building the parent module; the overlay adds its helper
 to the stock `net/http` package instead.
+
+## Request identity and debug metadata
+
+Only outbound requests missing a context ID get private stamped copies; the
+producer never stamps a caller-owned request in place. It links each stamped copy
+to the original request and unwraps only that exact copy to preserve
+`Response.Request`, redirect `CheckRedirect`'s `via`, and `Transport.CancelRequest`.
+Go's and applications' copies retain their own identity. Copying every request
+would break cancellation; in-place stamping would race with caller readers.
+Custom RoundTrippers, `Transport.Proxy`, and registered protocols may receive the
+private copy. Tracing-disabled behavior otherwise follows stock Go.
+
+Handler labels use function or underlying type names, without pointer prefixes.
+Stack-derived API IDs and debug goroutine IDs are best-effort metadata, not stable
+runtime interfaces or module identity. Recheck them on Go upgrades.
+
+The implementation is in `_goroot/src/net/http/conftamer.go`; capture regressions
+are in `tests/httpcapture/request_identity_test.go`, `capture_test.go`, and
+`metadata_test.go`. [README hook boundaries](README.md#instrumented-request-and-hook-boundaries)
+cover application-facing limitations.
 
 ## Changing instrumentation
 
